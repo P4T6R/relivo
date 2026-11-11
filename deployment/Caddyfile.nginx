@@ -1,0 +1,29 @@
+{
+    admin off
+    auto_https off
+}
+
+# Only the host Nginx may publish this ingress, on host loopback.
+# Nginx overwrites X-Real-IP; do not expose this listener publicly.
+http://:8088 {
+    @rendezvous path /ws/id
+    handle @rendezvous {
+        reverse_proxy 127.0.0.1:21118 {
+            header_up X-Real-IP {http.request.header.X-Real-IP}
+        }
+    }
+    @relay path /ws/relay
+    handle @relay {
+        reverse_proxy 127.0.0.1:21119 {
+            header_up X-Real-IP {http.request.header.X-Real-IP}
+        }
+    }
+    handle {
+        reverse_proxy 127.0.0.1:21114
+    }
+}
+
+http://127.0.0.1:2080 {
+    bind 127.0.0.1
+    respond /healthz "ok"
+}

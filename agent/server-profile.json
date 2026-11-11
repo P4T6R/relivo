@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "product": "Relivo Agent",
+  "api_origin": "https://relivo-desk.duckdns.org",
+  "id_server": "relivo-desk.duckdns.org:21116",
+  "relay_url": "wss://relivo-desk.duckdns.org/ws/relay",
+  "server_public_key": "Uhtx9GwCR0q773txHScYWMGbLv79bS7hhD5UjJ2FRB4=",
+  "managed_required": true
+}

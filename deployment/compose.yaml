@@ -1,0 +1,142 @@
+name: rustdesk-control
+
+x-common: &common
+  restart: unless-stopped
+  init: true
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  pids_limit: 128
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=64m,mode=1777"]
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  stop_grace_period: 30s
+  pull_policy: never
+
+services:
+  edge:
+    <<: *common
+    image: relivo/edge:${IMAGE_TAG:?Set IMAGE_TAG}
+    build: {context: .., dockerfile: deployment/Dockerfile, target: edge}
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN to your DNS name}
+    cap_add: [NET_BIND_SERVICE]
+    mem_limit: 192m
+    ports:
+      - "${PUBLIC_BIND:-0.0.0.0}:${HTTP_PORT:-80}:80/tcp"
+      - "${PUBLIC_BIND:-0.0.0.0}:${HTTPS_PORT:-443}:443/tcp"
+      - "${PUBLIC_BIND:-0.0.0.0}:${NAT_PORT:-21115}:21115/tcp"
+      - "${PUBLIC_BIND:-0.0.0.0}:${ID_PORT:-21116}:21116/tcp"
+      - "${PUBLIC_BIND:-0.0.0.0}:${ID_PORT:-21116}:21116/udp"
+    volumes:
+      - tls_data:/data
+      - tls_config:/config
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:2080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  management:
+    <<: *common
+    image: relivo/management:${IMAGE_TAG:?Set IMAGE_TAG}
+    build: {context: .., dockerfile: deployment/Dockerfile, target: management}
+    network_mode: service:edge
+    depends_on:
+      edge: {condition: service_healthy}
+    mem_limit: 512m
+    environment: &management-env
+      MANAGEMENT_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN}
+      MANAGEMENT_LISTEN: 127.0.0.1:21114
+      MANAGEMENT_INTERNAL_LISTEN: 127.0.0.1:21120
+      MANAGEMENT_INTERNAL_KEY_FILE: /run/secrets/internal_key
+    secrets: [internal_key]
+    volumes: ["management_data:/data"]
+    stop_signal: SIGINT
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "4", "http://127.0.0.1:21114/healthz"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  hbbs:
+    <<: *common
+    image: relivo/server:${IMAGE_TAG:?Set IMAGE_TAG}
+    build: {context: .., dockerfile: deployment/Dockerfile, target: server}
+    command: [hbbs, --bind, 0.0.0.0, --port, "21116", --key, "-"]
+    network_mode: service:edge
+    depends_on:
+      management: {condition: service_healthy}
+    mem_limit: 512m
+    environment: &server-env
+      MANAGEMENT_URL: http://127.0.0.1:21120
+      MANAGEMENT_INTERNAL_KEY_FILE: /run/secrets/internal_key
+      MANAGEMENT_RELAY_URL: ${RELAY_URL:?Set RELAY_URL}
+      TEST_HBBS: "no"
+      DISABLE_UPDATE_CHECK: "Y"
+    secrets: [internal_key]
+    volumes: ["peer_data:/data"]
+    healthcheck:
+      test: [CMD-SHELL, "test -s /data/id_ed25519.pub && nc -z -w 3 127.0.0.1 21118"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  hbbr:
+    <<: *common
+    image: relivo/server:${IMAGE_TAG:?Set IMAGE_TAG}
+    command: [hbbr, --bind, 127.0.0.1, --port, "21117", --key, "-"]
+    network_mode: service:edge
+    depends_on:
+      hbbs: {condition: service_healthy}
+    mem_limit: 512m
+    environment: *server-env
+    secrets: [internal_key]
+    volumes: ["peer_data:/data"]
+    healthcheck:
+      test: [CMD-SHELL, "nc -z -w 3 127.0.0.1 21119"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  bootstrap:
+    <<: *common
+    image: relivo/management:${IMAGE_TAG:?Set IMAGE_TAG}
+    profiles: [setup]
+    restart: "no"
+    network_mode: none
+    command: [init-admin, admin]
+    volumes: ["management_data:/data"]
+    mem_limit: 256m
+
+  snapshot:
+    <<: *common
+    image: relivo/management:${IMAGE_TAG:?Set IMAGE_TAG}
+    profiles: [maintenance]
+    restart: "no"
+    network_mode: none
+    entrypoint: [tar]
+    command: [-C, /snapshot, -czf, "-", management, peers, tls, tls-config]
+    volumes:
+      - management_data:/snapshot/management:ro
+      - peer_data:/snapshot/peers:ro
+      - tls_data:/snapshot/tls:ro
+      - tls_config:/snapshot/tls-config:ro
+    logging: {driver: none}
+    mem_limit: 128m
+
+secrets:
+  internal_key:
+    file: ${RUNTIME_DIR:-./runtime}/internal-key
+
+volumes:
+  management_data:
+  peer_data:
+  tls_data:
+  tls_config:

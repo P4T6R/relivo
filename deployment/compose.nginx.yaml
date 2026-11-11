@@ -1,0 +1,12 @@
+# Apply after compose.yaml on a host with an existing TLS-terminating Nginx.
+# !override requires Docker Compose 2.24.4 or newer.
+services:
+  edge:
+    ports: !override
+      - "127.0.0.1:${PROXY_PORT:-18083}:8088/tcp"
+      - "${PUBLIC_BIND:-0.0.0.0}:${NAT_PORT:-21115}:21115/tcp"
+      - "${PUBLIC_BIND:-0.0.0.0}:${ID_PORT:-21116}:21116/tcp"
+      - "${PUBLIC_BIND:-0.0.0.0}:${ID_PORT:-21116}:21116/udp"
+    cap_add: !reset []
+    volumes:
+      - ./Caddyfile.nginx:/etc/caddy/Caddyfile:ro

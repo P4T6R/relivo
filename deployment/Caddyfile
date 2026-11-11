@@ -1,0 +1,30 @@
+{
+    admin off
+    servers {
+        protocols h1 h2
+    }
+}
+
+{$DOMAIN} {
+    header Strict-Transport-Security "max-age=31536000"
+    @rendezvous path /ws/id
+    handle @rendezvous {
+        reverse_proxy 127.0.0.1:21118 {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    @relay path /ws/relay
+    handle @relay {
+        reverse_proxy 127.0.0.1:21119 {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle {
+        reverse_proxy 127.0.0.1:21114
+    }
+}
+
+http://127.0.0.1:2080 {
+    bind 127.0.0.1
+    respond /healthz "ok"
+}
