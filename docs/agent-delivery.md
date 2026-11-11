@@ -161,8 +161,8 @@ the corresponding fork sources and generated bridge in a separate archive.
 Compiled bundle -> dependency metadata -> isolated staging -> package files ->
 archive inspection -> secret-exclusion checks -> isolated launch/version test ->
 clean Debian installation/runtime dependency test -> checksums and delivery.
-Windows/macOS: access supplied -> toolchain preflight -> native build -> package
-inspection -> platform installation and permission tests. Signing identities
+Windows/macOS: hosted native runner -> toolchain preflight -> native build ->
+package inspection -> recipient installation and permission tests. Signing identities
 remain unspecified; identify unsigned output when it is produced.
 
 ### Distribution validation
@@ -223,7 +223,9 @@ and checksum inspection -> downloads -> recipient installation/session tests.
 Validate credential import and public defaults locally before publication.
 
 The first macOS arm64 job passed compilation, package tests, signing verification
-and DMG verification, but its Actions artifact upload failed. Delivery therefore
+and DMG verification, but its Actions artifact upload failed. Its final log
+reported `Failed to CreateArtifact` after five attempts receiving HTML instead
+of the expected JSON response. Delivery therefore
 uses a draft GitHub release, with separate checksums per platform. The draft is
 reviewable by the owner before publication. CI may reuse bridge artifacts from a
 previous run only after verifying the same repository/workflow and an identical
@@ -234,7 +236,35 @@ their respective operating systems. Failed jobs retain dependency caches.
 
 - Initial public source commit: `d24834b` in `P4T6R/relivo`, branch `main`.
 - First native build run: https://github.com/P4T6R/relivo/actions/runs/43091237911 .
-  Its completion and platform artifacts remain to be verified.
+  Windows and macOS arm64 passed native packaging and tests. Artifact delivery
+  failed, and this run was cancelled while macOS Intel was still running.
+- Recovery run: https://github.com/P4T6R/relivo/actions/runs/43098593778 , using
+  source commit `2c83b39` and draft release `relivo-agent-build-43098593778`.
+  All six jobs finished successfully, including Windows x64, macOS Intel and
+  macOS Apple Silicon. All native packages were delivered and downloaded.
+  Recipient installation/session acceptance is still required for every platform.
+- Windows and both macOS architectures each passed the managed-package tests and
+  the actual packaged executable's `--relivo-server-profile` command. Both macOS
+  jobs also verified the ad-hoc code signature and DMG with `hdiutil verify`.
+- The downloaded Windows EXE/ZIP and both macOS DMGs match both their published
+  SHA256SUMS and GitHub's independent asset digests. Their manifests identify
+  `2c83b394e66c60e15039d8c09f74689e208a8ab3` and contain only public server settings.
+  ZIP CRCs, required bundle files, x64 PE headers and the DMG UDIF trailer passed
+  inspection. No Windows bundle PE import names require an external
+  `msvcp`/`vcruntime` library.
+- Linux version `1.5.3+relivo.20261111.1` remains a separate, previously validated
+  build. Its DEB, portable archive, matching source archive/manifest, release
+  metadata and checksums were also uploaded to the draft release. Upload sizes
+  and GitHub asset digests match the original local packages.
+- Windows/macOS local downloads are in the ignored directory
+  `artifacts/agents/1.5.3-relivo.20261111.2/`; Linux outputs remain in
+  `artifacts/agents/1.5.3+relivo.20261111.1/`. No bundle contains a shared
+  enrollment credential. Follow `agent/package/README-native.md` or
+  `agent/package/README-linux.md` before testing on recipient machines.
+- The draft release contains 16 assets: four Windows files, three files for
+  each macOS architecture, and six Linux/source files. The owner can retrieve
+  them at https://github.com/P4T6R/relivo/releases/tag/untagged-14a49b46e754642d3934 .
+  The repository remains public; the release is deliberately still a draft.
 - The `relivo-managed` Linux library compiled successfully in the pinned builder.
   A separate copied bundle passed actual CLI checks for public defaults, token
   import, preservation of unrelated settings, rejection with a nonzero exit
@@ -249,8 +279,12 @@ their respective operating systems. Failed jobs retain dependency caches.
   return success after a command error. The gated Relivo initialization now exits
   with failure directly. Other startup paths are unchanged.
 - Existing shared files changed for native packaging: `rustdesk/Cargo.toml`
-  declares the opt-in feature, and `rustdesk/src/core_main.rs` calls its gated
-  initialization. Package logic stays in `rustdesk/src/management/package.rs`.
+  declares the opt-in feature, `rustdesk/src/management.rs` exposes its gated
+  submodule, and `rustdesk/src/core_main.rs` calls its gated initialization.
+  The managed build's startup now applies public server defaults and handles
+  enrollment/profile commands. These hooks are required for standalone native
+  executables; feature-off startup retains the existing path. Package logic
+  stays in `rustdesk/src/management/package.rs`.
 - The public-source audit excluded local databases, generated binaries, runtime
   profiles, and production credentials. The checked-in WebSocket test key is an
   existing test fixture, not a deployment key.
