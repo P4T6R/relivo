@@ -106,7 +106,8 @@ See [Linux packages](agent/package/README-linux.md).
 Windows x64, Mac Intel and Mac Apple Silicon builds use the manual
 [Build Relivo Agent workflow](.github/workflows/agent-build.yml). The workflow
 compiles the modified client on native runners, tests its public server settings,
-and uploads installers with checksums and source commit manifests. See
+and uploads installers to a draft release with checksums and source commit
+manifests. See
 [native installation and enrollment](agent/package/README-native.md). These test
 builds are not signed with a Windows certificate or notarized with Apple.
 

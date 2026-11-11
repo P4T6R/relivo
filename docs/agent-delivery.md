@@ -222,6 +222,14 @@ native jobs -> compile failures corrected from exact errors -> executable/DMG
 and checksum inspection -> downloads -> recipient installation/session tests.
 Validate credential import and public defaults locally before publication.
 
+The first macOS arm64 job passed compilation, package tests, signing verification
+and DMG verification, but its Actions artifact upload failed. Delivery therefore
+uses a draft GitHub release, with separate checksums per platform. The draft is
+reviewable by the owner before publication. CI may reuse bridge artifacts from a
+previous run only after verifying the same repository/workflow and an identical
+complete client source tree. Native executables are still built and tested on
+their respective operating systems. Failed jobs retain dependency caches.
+
 ### Hosted-build validation record
 
 - Initial public source commit: `d24834b` in `P4T6R/relivo`, branch `main`.
@@ -231,6 +239,9 @@ Validate credential import and public defaults locally before publication.
   A separate copied bundle passed actual CLI checks for public defaults, token
   import, preservation of unrelated settings, rejection with a nonzero exit
   status, no file change on rejection, and configuration mode `0600`.
+- `cargo test --locked --release --lib --features
+  flutter,linux-pkg-config,relivo-managed management::package::tests` passed:
+  two tests, zero failures.
 - The preservation check caught TOML table ordering in the older configuration
   writer. Serializing through `toml::Value::Table` preserves scalar-before-table
   ordering without replacing the existing atomic configuration writer.

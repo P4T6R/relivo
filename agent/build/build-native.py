@@ -81,9 +81,9 @@ else:
 
 commit = run("git", "rev-parse", "HEAD", capture_output=True, text=True).stdout.strip()
 (OUTPUT / f"{prefix}.json").write_text(json.dumps({"version": VERSION, "source_commit": commit, "architecture": ARCH, "system": platform.system(), "server_profile": profile, "signing": "unsigned" if WINDOWS else "ad-hoc (not notarized)"}, indent=2) + "\n")
-with (OUTPUT / "SHA256SUMS").open("w") as checksums:
+with (OUTPUT / f"{prefix}-SHA256SUMS").open("w") as checksums:
     for path in sorted(OUTPUT.iterdir()):
-        if path.name == "SHA256SUMS":
+        if path.name.endswith("-SHA256SUMS"):
             continue
         with path.open("rb") as contents:
             checksums.write(f"{hashlib.file_digest(contents, 'sha256').hexdigest()}  {path.name}\n")

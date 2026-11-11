@@ -1,10 +1,16 @@
 name: Build Relivo Agent
 on:
   workflow_dispatch:
+    inputs:
+      reuse_bridge_run:
+        description: 'Optional previous run ID; reuse requires identical client sources'
+        type: string
+        default: ''
 permissions:
   contents: read
+  actions: read
 concurrency:
-  group: relivo-agent-${{ github.ref }}
+  group: relivo-agent-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -24,17 +30,34 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Validate bridge source before reuse
+        if: inputs.reuse_bridge_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRIDGE_RUN_ID: ${{ inputs.reuse_bridge_run }}
+        run: python3 agent/build/check-bridge-reuse.py "$BRIDGE_RUN_ID"
+      - name: Restore verified bridge
+        if: inputs.reuse_bridge_run != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bridge-${{ matrix.flutter }}
+          path: rustdesk
+          run-id: ${{ inputs.reuse_bridge_run }}
+          github-token: ${{ github.token }}
       - name: Match Flutter 3.44 sources
         if: matrix.flutter == '3.44.9'
         working-directory: rustdesk
         run: bash .github/patches/apply_flutter_3.44_source_patches.sh
       - name: Build pinned bridge environment
+        if: inputs.reuse_bridge_run == ''
         run: >-
           docker build -f agent/build/linux.Dockerfile
           --build-arg FLUTTER_VERSION=${{ matrix.flutter }}
           --build-arg FLUTTER_SHA256=${{ matrix.sha256 }}
           -t relivo-bridge .
       - name: Generate matching native bridge
+        if: inputs.reuse_bridge_run == ''
         run: |
           docker run --rm --user 0:0 -e CI=true -e RELIVO_ALLOW_BRIDGE_GENERATION=owner-authorized \
             -v "$PWD/rustdesk:/work" -v "$PWD/agent/build:/build-scripts:ro" \
@@ -52,11 +75,37 @@ jobs:
             rustdesk/flutter/macos/Runner/bridge_generated.h
             rustdesk/flutter/ios/Runner/bridge_generated.h
 
+  prepare-release:
+    name: Prepare draft download release
+    needs: bridge
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: relivo-agent-build-${{ github.run_id }}
+    steps:
+      - name: Create or verify draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > draft-status.txt 2>/dev/null; then
+            test "$(cat draft-status.txt)" = true
+          else
+            gh release create "$RELEASE_TAG" --draft --prerelease --target "$GITHUB_SHA" \
+              --title "Relivo Agent test builds ($GITHUB_RUN_ID)" \
+              --notes 'Native Windows x64, macOS Intel and Apple Silicon builds. No shared enrollment credential is included. These test builds have no Windows signing certificate or Apple notarization. Follow agent/package/README-native.md in the matching source revision before enabling the background service.'
+          fi
+
   native:
     name: Build ${{ matrix.os }} / ${{ matrix.arch }}
-    needs: bridge
+    needs: [bridge, prepare-release]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: read
     env:
       CARGO_BUILD_JOBS: 3
       CARGO_PROFILE_RELEASE_LTO: thin
@@ -101,6 +150,7 @@ jobs:
         with:
           workspaces: rustdesk
           key: relivo-${{ matrix.triplet }}
+          cache-on-failure: true
       - name: Install official Flutter SDK and verify checksum
         run: python3 agent/build/install-flutter.py '${{ matrix.arch }}'
       - name: Disable SDK analytics
@@ -130,9 +180,9 @@ jobs:
           --x-install-root="$VCPKG_ROOT/installed"
       - name: Compile, test and package native agent
         run: python3 agent/build/build-native.py '${{ matrix.arch }}'
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: relivo-agent-${{ runner.os }}-${{ matrix.arch }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 30
+      - name: Deliver verified packages to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: relivo-agent-build-${{ github.run_id }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber
