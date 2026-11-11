@@ -222,6 +222,28 @@ native jobs -> compile failures corrected from exact errors -> executable/DMG
 and checksum inspection -> downloads -> recipient installation/session tests.
 Validate credential import and public defaults locally before publication.
 
+### Hosted-build validation record
+
+- Initial public source commit: `d24834b` in `P4T6R/relivo`, branch `main`.
+- First native build run: https://github.com/P4T6R/relivo/actions/runs/43091237911 .
+  Its completion and platform artifacts remain to be verified.
+- The `relivo-managed` Linux library compiled successfully in the pinned builder.
+  A separate copied bundle passed actual CLI checks for public defaults, token
+  import, preservation of unrelated settings, rejection with a nonzero exit
+  status, no file change on rejection, and configuration mode `0600`.
+- The preservation check caught TOML table ordering in the older configuration
+  writer. Serializing through `toml::Value::Table` preserves scalar-before-table
+  ordering without replacing the existing atomic configuration writer.
+- The invalid-token check caught an existing native-runner convention that can
+  return success after a command error. The gated Relivo initialization now exits
+  with failure directly. Other startup paths are unchanged.
+- Existing shared files changed for native packaging: `rustdesk/Cargo.toml`
+  declares the opt-in feature, and `rustdesk/src/core_main.rs` calls its gated
+  initialization. Package logic stays in `rustdesk/src/management/package.rs`.
+- The public-source audit excluded local databases, generated binaries, runtime
+  profiles, and production credentials. The checked-in WebSocket test key is an
+  existing test fixture, not a deployment key.
+
 ## Build references
 
 - Checked-in rustdesk/.github/workflows/bridge.yml and flutter-build.yml.
