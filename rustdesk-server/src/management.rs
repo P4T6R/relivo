@@ -71,19 +71,68 @@ fn manager() -> ResultType<&'static Manager> {
 pub(crate) fn relay_url() -> ResultType<String> {
     Ok(manager()?.relay.clone())
 }
-async fn post(path: &str, body: Value) -> ResultType<Value> {
-    let m = manager()?;
+/// Why a management API call did not succeed.
+///
+/// The rendezvous and relay servers report these two cases differently to the
+/// client and in the logs, so a refusal must never be confused with an outage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManagementError {
+    /// The API answered and refused the request (4xx status, or a 2xx body that
+    /// does not grant it). The text never contains a token or a ticket.
+    Denied(String),
+    /// The API could not be used: network error, timeout, 5xx or other
+    /// unexpected status, unreadable body, or management not initialized.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for ManagementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied(reason) => write!(f, "refused by the management API: {reason}"),
+            Self::Unavailable(reason) => write!(f, "management API unavailable: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ManagementError {}
+
+/// Maps an HTTP status to `None` (success) or the matching error.
+fn classify_status(status: reqwest::StatusCode) -> Option<ManagementError> {
+    if status.is_success() {
+        None
+    } else if status.is_client_error() {
+        Some(ManagementError::Denied(format!("HTTP {}", status.as_u16())))
+    } else {
+        Some(ManagementError::Unavailable(format!("HTTP {}", status.as_u16())))
+    }
+}
+
+async fn post(path: &str, body: Value) -> Result<Value, ManagementError> {
+    let m = manager().map_err(|e| ManagementError::Unavailable(e.to_string()))?;
     let response = m
         .client
         .post(format!("{}{path}", m.url))
         .header("X-Management-Key", &m.key)
         .json(&body)
         .send()
-        .await?;
-    if !response.status().is_success() {
-        bail!("Management authorization denied");
+        .await
+        .map_err(|e| {
+            // reqwest errors name the loopback URL and the cause, never the body or headers.
+            let kind = if e.is_timeout() { "timeout" } else { "request failed" };
+            ManagementError::Unavailable(format!("{kind} on {path}: {e}"))
+        })?;
+    if let Some(err) = classify_status(response.status()) {
+        return Err(match err {
+            ManagementError::Denied(r) => ManagementError::Denied(format!("{r} on {path}")),
+            ManagementError::Unavailable(r) => {
+                ManagementError::Unavailable(format!("{r} on {path}"))
+            }
+        });
     }
-    Ok(response.json().await?)
+    response
+        .json()
+        .await
+        .map_err(|e| ManagementError::Unavailable(format!("unreadable response on {path}: {e}")))
 }
 pub(crate) async fn authorize(
     token: &str,
@@ -91,16 +140,18 @@ pub(crate) async fn authorize(
     pk: &[u8],
     conn_type: i32,
     attempt: &str,
-) -> ResultType<()> {
+) -> Result<(), ManagementError> {
     let value=post("/authorize",json!({"token":token,"target":target,"public_key":base64::encode(pk),"conn_type":conn_type,"attempt":attempt})).await?;
     if value["allowed"] != true {
-        bail!("Management authorization denied");
+        return Err(ManagementError::Denied("authorization not granted".to_owned()));
     }
     Ok(())
 }
-pub(crate) async fn claim(ticket: &str, uuid: &str, target: &str) -> ResultType<()> {
+pub(crate) async fn claim(ticket: &str, uuid: &str, target: &str) -> Result<(), ManagementError> {
     if ticket.len() != 64 {
-        bail!("A managed relay ticket is required");
+        return Err(ManagementError::Denied(
+            "missing or malformed relay ticket".to_owned(),
+        ));
     }
     let result = post(
         "/relay/claim",
@@ -111,11 +162,59 @@ pub(crate) async fn claim(ticket: &str, uuid: &str, target: &str) -> ResultType<
         || result["target"].as_str() != Some(target)
         || result["attempt"].as_str() != Some(uuid)
     {
-        bail!("Invalid relay admission");
+        return Err(ManagementError::Denied(
+            "relay admission does not match the request".to_owned(),
+        ));
     }
     Ok(())
 }
-pub(crate) async fn event(uuid: &str, event: &str) -> ResultType<()> {
+pub(crate) async fn event(uuid: &str, event: &str) -> Result<(), ManagementError> {
     post("/relay/event", json!({"uuid":uuid,"event":event})).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn status_classification_separates_refusal_from_outage() {
+        assert_eq!(classify_status(StatusCode::OK), None);
+        assert_eq!(classify_status(StatusCode::NO_CONTENT), None);
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(
+                matches!(classify_status(status), Some(ManagementError::Denied(_))),
+                "{status}"
+            );
+        }
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::MOVED_PERMANENTLY,
+        ] {
+            assert!(
+                matches!(classify_status(status), Some(ManagementError::Unavailable(_))),
+                "{status}"
+            );
+        }
+    }
+
+    #[hbb_common::tokio::test]
+    async fn malformed_ticket_is_a_refusal() {
+        assert!(matches!(
+            claim("short", "e4c181d0-41c7-4ae6-8ef0-36581b6b2b12", "123456789").await,
+            Err(ManagementError::Denied(_))
+        ));
+    }
 }

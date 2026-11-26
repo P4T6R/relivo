@@ -15,7 +15,7 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use subtle::ConstantTimeEq;
 
 pub(crate) fn random_token() -> String {
@@ -165,6 +165,40 @@ pub(crate) async fn internal_auth(
     Ok(next.run(req).await)
 }
 
+/// Address used for sign-in limits and audit. Forwarding headers are trusted
+/// only from a loopback peer (the co-located reverse proxy); otherwise the TCP
+/// peer is used. A proxy in front of this service must overwrite `X-Real-IP`
+/// (or own the last `X-Forwarded-For` element) for every request.
+pub(crate) fn client_ip(peer: Option<IpAddr>, headers: &HeaderMap) -> String {
+    let Some(peer) = peer.map(|ip| ip.to_canonical()) else {
+        return "local".into();
+    };
+    if !peer.is_loopback() {
+        return peer.to_string();
+    }
+    let parse = |value: &str| value.trim().parse::<IpAddr>().ok().map(|ip| ip.to_canonical());
+    let mut real = headers.get_all("x-real-ip").iter();
+    let real = match (real.next(), real.next()) {
+        // An ambiguous (repeated) X-Real-IP is ignored rather than guessed.
+        (Some(value), None) => value.to_str().ok().and_then(parse),
+        _ => None,
+    };
+    real.or_else(|| {
+        headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(parse)
+    })
+    .unwrap_or(peer)
+    .to_string()
+}
+fn peer(remote: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
+    remote.map(|v| v.0 .0.ip())
+}
+
 #[derive(Deserialize)]
 struct Login {
     username: String,
@@ -179,7 +213,7 @@ async fn login(s: &AppState, raw: Bytes, ip: &str, kind: &str) -> ApiResult<(Pri
     }
     let username = input.username.to_ascii_lowercase();
     let mut tx = s.db.begin().await?;
-    sqlx::query("DELETE FROM login_limits WHERE resets_at<?")
+    sqlx::query("DELETE FROM login_limits WHERE resets_at<=?")
         .bind(now())
         .execute(&mut *tx)
         .await?;
@@ -245,7 +279,7 @@ async fn login(s: &AppState, raw: Bytes, ip: &str, kind: &str) -> ApiResult<(Pri
             "session",
             "denied",
             "authentication",
-            "Invalid credentials",
+            &format!("Invalid credentials ({kind}, from {ip})"),
         )
         .await?;
         tx.commit().await?;
@@ -288,7 +322,7 @@ async fn login(s: &AppState, raw: Bytes, ip: &str, kind: &str) -> ApiResult<(Pri
         "session",
         "allowed",
         "authentication",
-        kind,
+        &format!("{kind}, from {ip}"),
     )
     .await?;
     tx.commit().await?;
@@ -301,9 +335,7 @@ pub(crate) async fn web_login(
     raw: Bytes,
 ) -> ApiResult<Response> {
     origin(&s, &headers)?;
-    let ip = remote
-        .map(|v| v.0 .0.ip().to_string())
-        .unwrap_or_else(|| "local".into());
+    let ip = client_ip(peer(remote), &headers);
     let (p, token) = login(&s, raw, &ip, "web").await?;
     let mut response = Json(json!({"user":p,"csrf":p.csrf})).into_response();
     let secure = if s.secure_cookies { "; Secure" } else { "" };
@@ -318,11 +350,10 @@ pub(crate) async fn web_login(
 pub(crate) async fn native_login(
     State(s): State<AppState>,
     remote: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
     raw: Bytes,
 ) -> ApiResult<Json<Value>> {
-    let ip = remote
-        .map(|v| v.0 .0.ip().to_string())
-        .unwrap_or_else(|| "local".into());
+    let ip = client_ip(peer(remote), &headers);
     let (p, token) = login(&s, raw, &ip, "native").await?;
     Ok(Json(
         json!({"type":"access_token","access_token":token,"user":p.native_payload()}),

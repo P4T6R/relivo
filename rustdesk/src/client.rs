@@ -1659,26 +1659,36 @@ impl Client {
     }
 
     async fn start_managed(peer: &str, key: &str, token: &str) -> ResultType<((Stream, bool, Option<Vec<u8>>, Option<KcpStream>, &'static str), (i32, String), bool)> {
-        if key.is_empty() || token.is_empty() { bail!("Configure the server public key and sign in before connecting"); }
-        let mut rendezvous = crate::management::connect_websocket("/ws/id").await?;
+        if token.is_empty() { bail!("Sign in to Relivo on this computer (Settings > Account > Login) before connecting"); }
+        if key.is_empty() { bail!("The Relivo server public key is missing from this agent build"); }
+        let id_server = crate::management::websocket_url("/ws/id")?;
+        let mut rendezvous = crate::management::connect_websocket("/ws/id").await
+            .map_err(|e| anyhow!("Cannot reach the Relivo ID server ({id_server}): {e}"))?;
         let uuid = Uuid::new_v4().to_string();
         let mut request = RendezvousMessage::new();
         request.set_request_relay(RequestRelay { id: peer.to_owned(), uuid: uuid.clone(), token: token.to_owned(), secure: true, ..Default::default() });
-        rendezvous.send(&request).await?;
+        rendezvous.send(&request).await.map_err(|e| anyhow!("Cannot send the request to the Relivo ID server ({id_server}): {e}"))?;
         let response = crate::get_next_nonkeyexchange_msg(&mut rendezvous, Some(CONNECT_TIMEOUT)).await;
+        // hbbs sends a specific "Managed connection denied: ..." reason; show it as is.
         let response = match response.and_then(|m| m.union) {
             Some(rendezvous_message::Union::RelayResponse(r)) if r.refuse_reason.is_empty() => r,
-            _ => bail!("Managed connection denied or device offline"),
+            Some(rendezvous_message::Union::RelayResponse(r)) => bail!("{}", r.refuse_reason),
+            _ => bail!("No response from the Relivo ID server ({id_server})"),
         };
         let relay = crate::management::websocket_url("/ws/relay")?;
-        if response.uuid != uuid || response.relay_server != relay { bail!("Managed relay configuration mismatch"); }
+        if response.uuid != uuid { bail!("Managed relay configuration mismatch: session '{}' was answered for request '{}'", response.uuid, uuid); }
+        if response.relay_server != relay { bail!("Managed relay configuration mismatch: the ID server announced relay '{}', expected '{}'", response.relay_server, relay); }
         let ticket = crate::management::relay_ticket(peer, &uuid, false).await?;
-        let mut stream = crate::management::connect_websocket("/ws/relay").await?;
+        let mut stream = crate::management::connect_websocket("/ws/relay").await
+            .map_err(|e| anyhow!("Cannot reach the Relivo relay server ({relay}): {e}"))?;
         let mut join = RendezvousMessage::new();
         join.set_request_relay(RequestRelay { id: peer.to_owned(), uuid, token: ticket, licence_key: key.to_owned(), ..Default::default() });
-        stream.send(&join).await?;
-        let pk = Self::secure_connection(peer, response.pk().to_vec(), key, &mut stream).await?;
-        if pk.is_none() || !stream.is_secured() { bail!("Managed peer identity could not be verified"); }
+        stream.send(&join).await.map_err(|e| anyhow!("Cannot join the Relivo relay server ({relay}): {e}"))?;
+        let pk = Self::secure_connection(peer, response.pk().to_vec(), key, &mut stream).await
+            .map_err(|e| anyhow!("Secure handshake with managed device {peer} failed: {e}"))?;
+        if pk.is_none() || !stream.is_secured() {
+            bail!("Managed peer identity could not be verified: the key of device {peer} is not signed by the configured server key (server key mismatch or device registered elsewhere)");
+        }
         Ok(((stream, false, pk, None, "Relay"), (0, Config::get_rendezvous_server()), false))
     }
 

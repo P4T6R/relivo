@@ -217,7 +217,11 @@ pub async fn create_tcp_connection(
     secure: bool,
     meta: ConnectionMeta,
 ) -> ResultType<()> {
-    if crate::management::enabled() { bail!("Managed devices accept authorized relay connections only"); }
+    if crate::management::enabled() {
+        hbb_common::throttled_log!(std::time::Duration::from_secs(60), warn,
+            "Rejected direct connection from {addr}: managed devices accept authorized relay connections only");
+        bail!("Managed devices accept authorized relay connections only");
+    }
     create_admitted_tcp_connection(server, stream, addr, secure, meta).await
 }
 
@@ -412,10 +416,18 @@ async fn create_relay_connection_(
     meta: ConnectionMeta,
 ) -> ResultType<()> {
     if crate::management::enabled() {
-        if relay_server != crate::management::websocket_url("/ws/relay")? { bail!("Untrusted managed relay"); }
+        let expected = crate::management::websocket_url("/ws/relay")?;
+        if relay_server != expected {
+            log::error!("Managed relay mismatch: the ID server requested relay '{relay_server}', expected '{expected}'; check the relay-server setting of this device");
+            bail!("Untrusted managed relay '{relay_server}'");
+        }
         let id = Config::get_id();
-        let ticket = crate::management::relay_ticket(&id, &uuid, true).await?;
-        let mut stream = crate::management::connect_websocket("/ws/relay").await?;
+        let ticket = crate::management::relay_ticket(&id, &uuid, true).await.map_err(|e| {
+            log::error!("Managed relay ticket for device {id} failed: {e}");
+            e
+        })?;
+        let mut stream = crate::management::connect_websocket("/ws/relay").await
+            .map_err(|e| hbb_common::anyhow::anyhow!("Cannot reach the Relivo relay server ({expected}): {e}"))?;
         let mut join = RendezvousMessage::new();
         join.set_request_relay(RequestRelay { id, uuid, token: ticket, licence_key: crate::get_key(true).await, ..Default::default() });
         stream.send(&join).await?;

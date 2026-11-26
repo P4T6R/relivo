@@ -494,12 +494,36 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
+                // Never log rf.token (the relay ticket) or rf.licence_key.
+                let ip = hbb_common::try_into_v4(addr).ip();
+                let target = short(&rf.id);
+                let uuid = short(&rf.uuid);
                 if !key.is_empty() && rf.licence_key != key {
-                    log::warn!("Relay authentication failed from {} - invalid key", addr);
+                    log::warn!(
+                        "Relay request {:?} to {:?} from {} refused: client key differs from server public key: rebuild agents with the server's key",
+                        uuid, target, ip
+                    );
                     return;
                 }
                 if crate::management::enabled() {
-                    if !stream.is_ws() || crate::management::claim(&rf.token, &rf.uuid, &rf.id).await.is_err() {
+                    if !stream.is_ws() {
+                        log::warn!(
+                            "Managed relay request {:?} to {:?} from {} refused: not received through the TLS WebSocket proxy",
+                            uuid, target, ip
+                        );
+                        return;
+                    }
+                    if let Err(err) = crate::management::claim(&rf.token, &rf.uuid, &rf.id).await {
+                        match err {
+                            crate::management::ManagementError::Denied(_) => log::warn!(
+                                "Managed relay request {:?} to {:?} from {} refused: relay ticket rejected ({})",
+                                uuid, target, ip, err
+                            ),
+                            crate::management::ManagementError::Unavailable(_) => log::warn!(
+                                "Managed relay request {:?} to {:?} from {} refused: management API unavailable ({})",
+                                uuid, target, ip, err
+                            ),
+                        }
                         return;
                     }
                 }
@@ -508,7 +532,14 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     if let Some((_, mut peer)) = peers.remove(&rf.uuid) {
                         drop(peers);
                         if crate::management::enabled() {
-                            if crate::management::event(&rf.uuid, "paired").await.is_err() { return; }
+                            if let Err(err) = crate::management::event(&rf.uuid, "paired").await {
+                                // Both legs are dropped: the pairing was not recorded as allowed.
+                                log::warn!(
+                                    "Managed relay {:?} to {:?} from {} closed: the management API did not accept the paired event ({})",
+                                    uuid, target, ip, err
+                                );
+                                return;
+                            }
                         }
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
@@ -530,7 +561,12 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         }
                         USAGE.write().await.remove(&id);
                         if crate::management::enabled() {
-                            allow_err!(crate::management::event(&rf.uuid, "ended").await);
+                            if let Err(err) = crate::management::event(&rf.uuid, "ended").await {
+                                log::warn!(
+                                    "Managed relay {:?} to {:?}: the ended event was not recorded ({})",
+                                    uuid, target, err
+                                );
+                            }
                         }
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
@@ -538,7 +574,12 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         peers.insert(rf.uuid.clone(), (generation.clone(), Box::new(stream)));
                         drop(peers);
                         sleep(30.).await;
-                        expire_waiter(&mut *PEERS.lock().await, &rf.uuid, &generation);
+                        if expire_waiter(&mut *PEERS.lock().await, &rf.uuid, &generation) {
+                            log::info!(
+                                "Relay request {:?} to {:?} from {} expired: no peer joined within 30 s",
+                                uuid, target, ip
+                            );
+                        }
                     }
                 }
             }
@@ -547,10 +588,22 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
 }
 
 /// Removes a waiting connection only if it still owns the requested pair ID.
-fn expire_waiter(peers: &mut HashMap<String, WaitingPeer>, id: &str, generation: &Arc<()>) {
+/// Returns whether the waiter was removed (it was still unpaired).
+fn expire_waiter(peers: &mut HashMap<String, WaitingPeer>, id: &str, generation: &Arc<()>) -> bool {
     if peers.get(id).map(|(current, _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
         peers.remove(id);
+        return true;
     }
+    false
+}
+
+/// Bounds a client-supplied field before it is logged (print it with `{:?}`).
+fn short(value: &str) -> &str {
+    let mut end = value.len().min(128);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// Forwards traffic in both directions while enforcing relay limits and timeouts.
@@ -999,9 +1052,10 @@ mod waiter_tests {
         let current = Arc::new(());
         let mut peers: HashMap<String, WaitingPeer> = HashMap::new();
         peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream)));
-        expire_waiter(&mut peers, "pair", &old);
+        assert!(!expire_waiter(&mut peers, "pair", &old));
         assert!(peers.contains_key("pair"));
-        expire_waiter(&mut peers, "pair", &current);
+        assert!(expire_waiter(&mut peers, "pair", &current));
         assert!(!peers.contains_key("pair"));
+        assert!(!expire_waiter(&mut peers, "pair", &current));
     }
 }

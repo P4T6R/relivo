@@ -93,6 +93,20 @@ const time = (value: number | null) =>
         minute: "2-digit",
       })
     : "No report yet";
+/** Why the device's own reports are refused, or null when nothing is wrong. */
+function deviceWarning(d: Device): string | null {
+  switch (d.last_rejection) {
+    case "uuid":
+    case "public_key":
+    case "uuid_public_key":
+      return "Agent identity changed (reinstalled?): rotate the credential, then re-enroll the device.";
+    case "id_mismatch":
+      return "This device's credential is installed on a computer reporting another ID. Install it on the matching computer (see Activity).";
+  }
+  if (!d.verified)
+    return "Waiting for the agent's first report: the credential is not installed on this computer, or the ID does not match.";
+  return null;
+}
 const errorText = (e: unknown) =>
   e instanceof Error ? e.message : "Something went wrong.";
 function Badge({
@@ -558,6 +572,16 @@ function App() {
                                 <div>
                                   <strong>{d.name}</strong>
                                   <code>{d.id}</code>
+                                  {deviceWarning(d) && (
+                                    <small
+                                      className={
+                                        "device-warning" +
+                                        (d.verified ? " critical" : "")
+                                      }
+                                    >
+                                      {deviceWarning(d)}
+                                    </small>
+                                  )}
                                 </div>
                               </div>
                             </td>
@@ -1351,6 +1375,20 @@ function EditorDialog({
               </label>
               {editor.item ? (
                 <>
+                  {deviceWarning(editor.item) && (
+                    <div className="alert" role="status">
+                      <span>
+                        {deviceWarning(editor.item)}
+                        {editor.item.last_rejected_at && (
+                          <>
+                            {" "}
+                            Last refused report:{" "}
+                            {time(editor.item.last_rejected_at)}.
+                          </>
+                        )}
+                      </span>
+                    </div>
+                  )}
                   <p className="helper">
                     {editor.item.verified
                       ? "The device has reported using its enrollment credential. Confirm its identity before approving."

@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::ConnectInfo,
     http::{Request, StatusCode},
     Router,
 };
@@ -7,7 +8,8 @@ use base64::Engine;
 use http_body_util::BodyExt;
 use rustdesk_management::{create_admin, internal_router, open_database, public_router, AppState};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
@@ -63,6 +65,39 @@ async fn call(
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     let data = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, data, cookie)
+}
+/// Sends a request as a TCP peer with extra headers; returns the raw body text.
+async fn raw(
+    app: &Router,
+    path: &str,
+    token: &str,
+    body: &str,
+    peer: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("origin", "http://127.0.0.1:21114")
+        .header("content-type", "application/json");
+    if !token.is_empty() {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let mut req = req.body(Body::from(body.to_owned())).unwrap();
+    if let Some(peer) = peer {
+        let addr: SocketAddr = peer.parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+    }
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+fn pk(byte: u8) -> String {
+    base64::engine::general_purpose::STANDARD.encode([byte; 32])
 }
 impl Harness {
     async fn new() -> Self {
@@ -173,6 +208,17 @@ impl Harness {
             .as_str()
             .unwrap()
             .into()
+    }
+    async fn audit_total(&self, query: &str) -> i64 {
+        self.api("GET", &format!("/management/v1/audit?q={query}"), Value::Null)
+            .await["total"]
+            .as_i64()
+            .unwrap()
+    }
+    async fn device_record(&self, id: &str) -> Value {
+        self.api("GET", &format!("/management/v1/devices/{id}"), Value::Null)
+            .await["device"]
+            .clone()
     }
     async fn ticket(&self, who: &Identity, target: &str, uuid: &str, role: &str) -> Value {
         let (status, data, _) = call(
@@ -664,7 +710,7 @@ async fn grant_revocation_disable_and_expiry_invalidate_previously_minted_ticket
         )
         .await
         .0,
-        StatusCode::FORBIDDEN
+        StatusCode::UNAUTHORIZED
     );
 }
 
@@ -803,9 +849,431 @@ async fn login_throttle_and_native_wire_contract_are_observable() {
             .0,
         StatusCode::FORBIDDEN
     );
+    // The native client reads 404 here as "legacy address book"; 405 was shown as an error.
+    for path in ["/api/ab/settings", "/api/ab/personal"] {
+        assert_eq!(
+            call(&h.app, "POST", path, &identity, Value::Null).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
     let (_, book, _) = call(&h.app, "GET", "/api/ab", &identity, Value::Null).await;
     assert_eq!(
         serde_json::from_str::<Value>(book["data"].as_str().unwrap()).unwrap()["peers"],
         json!([])
     );
+}
+
+#[tokio::test]
+async fn rejected_device_reports_are_recorded_and_audited_once_per_window() {
+    let h = Harness::new().await;
+    let device = h.device("333333", true).await;
+    let report = |uuid: &str, key: u8| json!({"id":"333333","uuid":uuid,"management_pk":pk(key)});
+    // A reinstalled agent: same credential, new key pair, reporting every ~15 s.
+    for _ in 0..3 {
+        let (status, body, _) =
+            call(&h.app, "POST", "/api/heartbeat", &device, report("uuid-333333", 9)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "device identity changed; re-enrollment required");
+    }
+    assert_eq!(h.audit_total("device.identity_mismatch").await, 1);
+    let log = h
+        .api("GET", "/management/v1/audit?q=device.identity_mismatch", Value::Null)
+        .await;
+    assert!(log["items"][0]["detail"].as_str().unwrap().contains("public key"));
+    assert!(!log.to_string().contains(&device.token));
+    let record = h.device_record("333333").await;
+    assert_eq!(record["last_rejection"], "public_key");
+    assert!(record["last_rejected_at"].as_i64().is_some());
+    assert_eq!(record["state"], "approved");
+    // A different reason is audited immediately; the same one again after the window.
+    call(&h.app, "POST", "/api/heartbeat", &device, report("other-uuid", 7)).await;
+    assert_eq!(h.audit_total("device.identity_mismatch").await, 2);
+    assert_eq!(h.device_record("333333").await["last_rejection"], "uuid");
+    call(&h.app, "POST", "/api/heartbeat", &device, report("other-uuid", 7)).await;
+    assert_eq!(h.audit_total("device.identity_mismatch").await, 2);
+    sqlx::query("UPDATE devices SET last_rejected_at=last_rejected_at-601")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    call(&h.app, "POST", "/api/heartbeat", &device, report("other-uuid", 7)).await;
+    assert_eq!(h.audit_total("device.identity_mismatch").await, 3);
+    // The pinned agent still reports: a recent conflict stays visible, a stale one clears.
+    let (status, _, _) =
+        call(&h.app, "POST", "/api/heartbeat", &device, report("uuid-333333", 7)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h.device_record("333333").await["last_rejection"], "uuid");
+    sqlx::query("UPDATE devices SET last_rejected_at=last_rejected_at-601")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    call(&h.app, "POST", "/api/heartbeat", &device, report("uuid-333333", 7)).await;
+    let record = h.device_record("333333").await;
+    assert_eq!(record["last_rejection"], "");
+    assert!(record["last_rejected_at"].is_null());
+    // The credential installed on a computer with another ID: still 401, but attributed.
+    let (status, body, _) = call(
+        &h.app,
+        "POST",
+        "/api/heartbeat",
+        &device,
+        json!({"id":"999999","uuid":"uuid-333333","management_pk":pk(7)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "device ID does not match the credential");
+    assert_eq!(h.device_record("333333").await["last_rejection"], "id_mismatch");
+    let log = h
+        .api("GET", "/management/v1/audit?q=device.identity_mismatch", Value::Null)
+        .await;
+    assert!(log["items"][0]["detail"].as_str().unwrap().contains("999999"));
+    // An unknown credential writes nothing: no audit row and no device row.
+    let before = h.api("GET", "/management/v1/audit", Value::Null).await["total"].clone();
+    let stranger = Identity {
+        token: "ab".repeat(32),
+        ..Default::default()
+    };
+    for id in ["777777", "888888"] {
+        let (status, _, _) = call(
+            &h.app,
+            "POST",
+            "/api/heartbeat",
+            &stranger,
+            json!({"id":id,"uuid":"x","management_pk":pk(1)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(h.api("GET", "/management/v1/audit", Value::Null).await["total"], before);
+    assert_eq!(h.api("GET", "/management/v1/devices", Value::Null).await["total"], 1);
+    // Disabling is recorded without an identity event; rotation clears everything.
+    h.api(
+        "PUT",
+        "/management/v1/devices/333333",
+        json!({"name":"Workstation 333333","state":"disabled"}),
+    )
+    .await;
+    let (status, body, _) =
+        call(&h.app, "POST", "/api/heartbeat", &device, report("uuid-333333", 7)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "device disabled");
+    assert_eq!(h.device_record("333333").await["last_rejection"], "disabled");
+    assert_eq!(h.audit_total("device.identity_mismatch").await, 4);
+    h.api("POST", "/management/v1/devices/333333/credential", json!({}))
+        .await;
+    let record = h.device_record("333333").await;
+    assert_eq!(record["last_rejection"], "");
+    assert!(record["last_rejected_at"].is_null());
+    assert_eq!(record["verified"], false);
+}
+
+fn is_backup(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.contains(".pre-v2-") && name.ends_with(".bak")
+}
+#[tokio::test]
+async fn version_1_database_is_migrated_in_place_without_data_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("management.sqlite");
+    {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let db = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        sqlx::raw_sql(include_str!("fixtures/schema-v1.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO users(id,username,display_name,password_hash,role,created_at) VALUES('u1','owner','Owner','hash','admin',1);
+            INSERT INTO devices(id,name,platform,state,credential_hash,uuid,public_key,verified,last_seen,created_at,note) VALUES('123456','Front desk','Windows','approved','cred','uuid','pk',1,5,1,'kept');
+            INSERT INTO audit(time,actor,action,target,outcome,source,detail) VALUES(1,'owner','device.create','123456','allowed','administrator','');")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+    }
+    let db = open_database(&path).await.unwrap();
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(version, 2);
+    let row: (String, String, String, i64, String, Option<i64>, String) = sqlx::query_as(
+        "SELECT name,state,public_key,last_seen,note,last_rejected_at,last_rejection FROM devices WHERE id='123456'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        ("Front desk".into(), "approved".into(), "pk".into(), 5, "kept".into(), None, String::new())
+    );
+    let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM users),(SELECT count(*) FROM audit)")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(counts, (1, 1));
+    db.close().await;
+    let backups: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| is_backup(&e.file_name()))
+        .collect();
+    assert_eq!(backups.len(), 1);
+    let backup = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(backups[0].path())
+            .read_only(true),
+    )
+    .await
+    .unwrap();
+    let old: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT user_version FROM pragma_user_version),(SELECT count(*) FROM devices)",
+    )
+    .fetch_one(&backup)
+    .await
+    .unwrap();
+    assert_eq!(old, (1, 1));
+    backup.close().await;
+    // Reopening a current database does not migrate (or back up) again.
+    open_database(&path).await.unwrap().close().await;
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| is_backup(&e.as_ref().unwrap().file_name()))
+            .count(),
+        1
+    );
+    let newer = dir.path().join("newer.sqlite");
+    {
+        let db = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&newer)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql("CREATE TABLE t(x); PRAGMA user_version = 3;")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+    }
+    assert!(open_database(&newer).await.is_err());
+}
+
+#[tokio::test]
+async fn sysinfo_endpoints_use_the_rustdesk_client_wire_format() {
+    let h = Harness::new().await;
+    let device = h.device("444444", true).await;
+    let info = json!({"id":"444444","uuid":"uuid-444444","management_pk":pk(7),"os":"Windows 11 Pro"}).to_string();
+    let (status, body) = raw(&h.app, "/api/sysinfo", &device.token, &info, None, &[]).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "SYSINFO_UPDATED"));
+    assert_eq!(h.device_record("444444").await["platform"], "Windows 11 Pro");
+    assert_eq!(
+        raw(&h.app, "/api/sysinfo", "", &info, None, &[]).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // The client posts an empty body and compares the raw string with its stored copy.
+    let (status, version) = raw(&h.app, "/api/sysinfo_ver", &device.token, "", None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(version.starts_with("1-") && !version.contains('{'), "{version}");
+    assert_eq!(
+        raw(&h.app, "/api/sysinfo_ver", &device.token, "", None, &[]).await.1,
+        version
+    );
+    assert_eq!(
+        raw(&h.app, "/api/sysinfo_ver", "", "", None, &[]).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let rotated = h
+        .api("POST", "/management/v1/devices/444444/credential", json!({}))
+        .await["credential"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        raw(&h.app, "/api/sysinfo_ver", &device.token, "", None, &[]).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, renewed) = raw(&h.app, "/api/sysinfo_ver", &rotated, "", None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(renewed, version);
+    // The heartbeat stays a JSON object that the client parses as a map.
+    let beat = json!({"id":"444444","uuid":"uuid-444444","management_pk":pk(7)}).to_string();
+    let (status, body) = raw(&h.app, "/api/heartbeat", &rotated, &beat, None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(serde_json::from_str::<Value>(&body).unwrap().is_object());
+}
+
+#[tokio::test]
+async fn device_update_without_state_keeps_the_current_state_and_details() {
+    let h = Harness::new().await;
+    h.device("555555", true).await;
+    h.api(
+        "PUT",
+        "/management/v1/devices/555555",
+        json!({"name":"Renamed workstation"}),
+    )
+    .await;
+    let record = h.device_record("555555").await;
+    assert_eq!(record["name"], "Renamed workstation");
+    assert_eq!(record["state"], "approved");
+    assert_eq!(record["platform"], "Linux");
+    h.api(
+        "PUT",
+        "/management/v1/devices/555555",
+        json!({"name":"Renamed workstation","state":"pending","note":"Check"}),
+    )
+    .await;
+    let record = h.device_record("555555").await;
+    assert_eq!(record["state"], "pending");
+    assert_eq!(record["note"], "Check");
+    let (status, _, _) = call(
+        &h.app,
+        "PUT",
+        "/management/v1/devices/555555",
+        &h.admin,
+        json!({"name":"Renamed workstation","state":"unknown"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn sign_in_limits_use_the_forwarded_address_only_behind_a_loopback_proxy() {
+    let h = Harness::new().await;
+    let bucket = |ip: &str| format!("ip:{}", hex::encode(Sha256::digest(ip.as_bytes())));
+    sqlx::query("INSERT INTO login_limits(bucket,count,resets_at) VALUES(?,40,strftime('%s','now')+60)")
+        .bind(bucket("203.0.113.7"))
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let login = json!({"username":"admin","password":PASSWORD}).to_string();
+    let native = |peer: &'static str, headers: &'static [(&'static str, &'static str)]| {
+        let (app, login) = (h.app.clone(), login.clone());
+        async move { raw(&app, "/api/login", "", &login, Some(peer), headers).await.0 }
+    };
+    // The exhausted client is limited; other clients behind the same proxy are not.
+    assert_eq!(
+        native("127.0.0.1:50000", &[("x-real-ip", "203.0.113.7")]).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        native("127.0.0.1:50001", &[("x-real-ip", "198.51.100.9")]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        native("127.0.0.1:50002", &[("x-forwarded-for", "192.0.2.200, 203.0.113.7")]).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Invalid header values fall back to the peer address.
+    assert_eq!(
+        native("127.0.0.1:50003", &[("x-real-ip", "203.0.113.7; DROP")]).await,
+        StatusCode::OK
+    );
+    // A non-proxy peer cannot choose its bucket with headers.
+    assert_eq!(
+        native("192.0.2.10:50004", &[("x-real-ip", "203.0.113.7")]).await,
+        StatusCode::OK
+    );
+    let (status, _) = raw(
+        &h.app,
+        "/management/v1/login",
+        "",
+        &login,
+        Some("127.0.0.1:50005"),
+        &[("x-real-ip", "203.0.113.7")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let log = h
+        .api("GET", "/management/v1/audit?q=login", Value::Null)
+        .await
+        .to_string();
+    for ip in ["198.51.100.9", "127.0.0.1", "192.0.2.10"] {
+        assert!(log.contains(&format!("from {ip}")), "{ip}: {log}");
+    }
+    assert!(!log.contains("DROP"));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM login_limits WHERE bucket=?")
+        .bind(bucket("198.51.100.9"))
+        .fetch_one(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn connection_refusals_state_a_reason_and_audit_it_without_secrets() {
+    let h = Harness::new().await;
+    let (_, operator) = h.user("support", "operator").await;
+    let (viewer_id, viewer) = h.user("observer", "viewer").await;
+    let device = h.device("666666", true).await;
+    h.device("666667", false).await;
+    h.api(
+        "POST",
+        "/management/v1/devices",
+        json!({"id":"666668","name":"Never reported"}),
+    )
+    .await;
+    let group = h.group("Observers", vec![&viewer_id], vec!["666666"]).await;
+    h.grant(&group, &group).await;
+    let admin = h.login("admin").await;
+    let ticket = |who: &Identity, target: &str, role: &str| {
+        let (app, who) = (h.app.clone(), who.clone());
+        let body = json!({"target":target,"uuid":"reason-attempt-0001","role":role});
+        async move {
+            let (status, body, _) =
+                call(&app, "POST", "/api/management/relay-ticket", &who, body).await;
+            (status, body["error"].as_str().unwrap_or("").to_owned())
+        }
+    };
+    let denied = |reason: &str| (StatusCode::FORBIDDEN, reason.to_owned());
+    assert_eq!(ticket(&operator, "666666", "controller").await, denied("no connect grant"));
+    assert_eq!(ticket(&viewer, "666666", "controller").await, denied("viewer role cannot connect"));
+    assert_eq!(ticket(&admin, "666667", "controller").await, denied("device not approved"));
+    assert_eq!(ticket(&admin, "666668", "controller").await, denied("device not verified"));
+    let expired = Identity {
+        token: "cd".repeat(32),
+        ..Default::default()
+    };
+    assert_eq!(
+        ticket(&expired, "666666", "controller").await,
+        (StatusCode::UNAUTHORIZED, "session expired".to_owned())
+    );
+    assert_eq!(
+        ticket(&expired, "666666", "device").await,
+        (StatusCode::UNAUTHORIZED, "device credential invalid".to_owned())
+    );
+    assert_eq!(ticket(&device, "666666", "device").await.0, StatusCode::OK);
+    let authorize = |token: &str, key: u8| {
+        let private = h.private.clone();
+        let body = json!({"target":"666666","public_key":pk(key),"conn_type":0,"token":token,"attempt":"authorize-reason-01"});
+        async move {
+            let (status, body, _) = call(&private, "POST", "/authorize", &Identity::default(), body).await;
+            (status, body["error"].as_str().unwrap_or("").to_owned())
+        }
+    };
+    assert_eq!(authorize(&viewer.token, 7).await, denied("viewer role cannot connect"));
+    assert_eq!(authorize(&admin.token, 9).await, denied("device identity mismatch"));
+    assert_eq!(
+        authorize(&expired.token, 7).await,
+        (StatusCode::UNAUTHORIZED, "session expired".to_owned())
+    );
+    assert_eq!(authorize(&admin.token, 7).await.0, StatusCode::OK);
+    let log = h
+        .api("GET", "/management/v1/audit?q=connection.authorize", Value::Null)
+        .await;
+    assert_eq!(log["total"], 4);
+    let details: Vec<&str> = log["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["detail"].as_str().unwrap())
+        .collect();
+    assert!(details.contains(&"authorize-reason-01: viewer role cannot connect"));
+    assert!(details.contains(&"authorize-reason-01: device identity mismatch"));
+    assert!(details.contains(&"authorize-reason-01"));
+    for secret in [&viewer.token, &admin.token, &device.token] {
+        assert!(!log.to_string().contains(secret.as_str()));
+    }
 }

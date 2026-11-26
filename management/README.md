@@ -33,6 +33,11 @@ recognizes this workspace's locally extracted toolchain/development packages.
   sessions.
 - Device enrollment credentials shown once; UUID/public-key pinning on the
   first authenticated report; manual approval and credential rotation.
+  Refused reports from a credential holder (changed UUID/public key, another
+  device ID, disabled device) are shown on the device and audited as
+  `device.identity_mismatch` at most once per device and reason every 10 minutes.
+  Reports with an unknown credential are not stored; they are logged at most once
+  a minute.
 - Groups containing people/devices; explicit view or connect grants between
   groups. A connect grant includes visibility; viewers cannot connect.
 - Scoped inventory in both web and native APIs. Pagination and search.
@@ -98,6 +103,9 @@ Revocation blocks new sessions; V1 does not forcibly terminate existing sessions
    status in `../docs/enterprise/implementation-status.md` before deployment.
 2. Set a real domain with valid HTTPS/WSS certificates. Use the example Caddy
    configuration with your actual host name. Keep backend listeners private.
+   Sign-in limits use `X-Real-IP` (else the last `X-Forwarded-For` element) only
+   when the peer is loopback, so the proxy in front of port 21114 must overwrite
+   `X-Real-IP` with the client address on every request.
 3. Create a private data directory and generate an internal secret of at least
    32 random bytes. Set the variables shown in `.env.example`; protect secret
    files and databases with restrictive permissions.
@@ -127,9 +135,14 @@ configuration. Keep backups private. Restore all corresponding files while the
 services are stopped, preserve permissions, then test login, grants, device
 identity, and a denied connection before reopening access.
 
-Schema version 1 initializes only an empty database. Unknown/populated schemas
-are refused, not overwritten or automatically migrated. No existing production
-database has been changed by this implementation.
+A new database is created at schema version 2. A version 1 database is upgraded
+in place at startup: a consistent copy is first written next to it with
+`VACUUM INTO` (`<database>.pre-v2-<unix time>.bak`, same directory and file permissions; it
+holds the same secrets), then the two device-diagnostic columns are added
+and the version is set in one transaction. If the copy fails, startup stops and
+the database is left unchanged. Delete the copy once the upgrade is verified.
+Unknown or newer schemas and populated databases without a version are refused,
+never overwritten.
 
 ## Verification commands
 

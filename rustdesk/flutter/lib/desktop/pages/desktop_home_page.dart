@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/widgets/animated_rotation_widget.dart';
 import 'package:flutter_hbb/common/widgets/custom_password.dart';
+import 'package:flutter_hbb/common/widgets/relivo_enrollment.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/connection_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
@@ -92,6 +93,15 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       buildTip(context),
       if (!isOutgoingOnly) buildIDBoard(context),
       if (!isOutgoingOnly) buildPasswordBoard(context),
+      if (!isOutgoingOnly && isRelivoManagementRequired())
+        Obx(() => relivoDeviceEnrolled.value
+            ? const SizedBox.shrink()
+            : buildInstallCard(
+                'Warning',
+                kRelivoNotEnrolledHomeTip,
+                'Enter token',
+                showRelivoEnrollmentDialog,
+              )),
       FutureBuilder<Widget>(
         future: Future.value(
             Obx(() => buildHelpCards(stateGlobal.updateUrl.value))),
@@ -583,7 +593,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       bool? closeButton,
       String? closeOption}) {
     if (bind.mainGetBuildinOption(key: kOptionHideHelpCards) == 'Y' &&
-        content != 'install_daemon_tip') {
+        content != 'install_daemon_tip' &&
+        content != kRelivoNotEnrolledHomeTip) {
       return const SizedBox();
     }
     void closeCard() async {
@@ -701,6 +712,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     super.initState();
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
+      // Picks up token changes made elsewhere, or reverted by the server.
+      refreshRelivoEnrollmentState();
       final error = await bind.mainGetError();
       if (systemError != error) {
         systemError = error;
