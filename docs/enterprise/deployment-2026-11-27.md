@@ -56,3 +56,23 @@ the assistant); the v1 -> v2 upgrade message shows the existing database was use
 - Rollback across this schema change needs the backup above and the 2026-11-11.2
   images together; restoring the old images alone is not supported.
 - The native Windows agent paths of this branch still need a real Windows run.
+
+## Second upgrade the same day: 2026-11-27.2
+
+Requested by the owner after the [security review](security-review-2026-11-27.md).
+Images 2026-11-27.2 were built from 16a13f2, passed
+`node deployment/test-stack.mjs 2026-11-27.2 --nginx`, and were installed at
+/opt/relivo-2026-11-27.2 with the same procedure (script copied to the VPS and run
+with standard input closed). Schema unchanged (v2).
+
+- Backup before the change:
+  /opt/rustdesk-control-backups/20261127T224131Z-before-2026-11-27.2
+  (stopped-stack snapshot, configuration copy, 2026-11-27.1 manifest).
+- `IMAGE_TAG` changed from 2026-11-27.1 to 2026-11-27.2; volumes, configuration,
+  DNS, Nginx and certificate unchanged. /opt/relivo-2026-11-27.1 and its images
+  remain for rollback (same schema, so its images alone can be restarted).
+- Verified: four services healthy with no restarts; `MANAGEMENT_REQUIRED=Y` in
+  hbbs; server key fingerprint unchanged; public /healthz ok, HTTP 308 redirect,
+  /api/ab/* 404, WSS upgrades on /ws/id and /ws/relay; TCP 21115/21116 reachable
+  and 18083, 21114, 21117–21120 closed; other host projects still running.
+- Removed the leftover /root/relivo-03-finish.sh from the first upgrade.
