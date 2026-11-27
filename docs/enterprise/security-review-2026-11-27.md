@@ -32,8 +32,8 @@ session.
 ## Active attack run (isolated local stack)
 
 `node management/tests/attack-smoke.mjs` starts management,
-hbbs and hbbr with temporary data on loopback and attempts 32 attacks. Final
-result: 32 blocked, 0 successful. Covered: device ID takeover with another UUID,
+hbbs and hbbr with temporary data on loopback and attempts 35 attacks. Final
+result: 35 blocked, 0 successful; it exits 1 if any attack succeeds. Covered: device ID takeover with another UUID,
 key substitution with the same UUID, legacy punch-hole and relay requests over
 UDP, device token used as an account, viewer and ungranted operator connections,
 forged tokens, cross-role and cross-device ticket minting, ticket reuse with
@@ -42,7 +42,9 @@ public listener, wrong internal key, CSRF without token, foreign Origin, operato
 privilege escalation (create admin, self-promotion, grants), session reuse after
 logout, disabled user keeping agent access, brute force throttling, lockout of the
 real administrator, 20 MB request body, 60 KB key registration, log injection
-through the device ID, and a device reporting as another device.
+through the device ID, a device reporting as another device, a running session
+after the controller account is disabled (cut within 60 s), a flood of managed
+requests on `/ws/id`, and hbbs started without its management settings.
 
 ## Production checks (non-destructive)
 
@@ -61,39 +63,38 @@ CSP, `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `nosniff`,
 | One spoofed UDP RegisterPk could store and log about 64 KB per new ID | Medium | Key must be 32 bytes, UUID at most 128 bytes, ID in the RustDesk alphabet (`rustdesk-server/src/rendezvous_server.rs`) |
 | Device IDs with line breaks could forge hbbs log lines; full keys were logged | Low | IDs logged escaped and bounded; key/UUID logged by length only (`peer.rs`) |
 | Server-supplied refusal and mismatch texts were shown unfiltered by the agent | Low | One line, no control characters, bounded (`rustdesk/src/management.rs` `display_text`) |
+| Revoking a user, grant or device did not end a running session | Medium | hbbr re-checks every 60 s (`relay/event` "active") and cuts the relay on refusal; an unreachable API keeps it. Expired native sign-ins are kept one more day so a long session outlives the 8 h sign-in, while logout, disable and password change still end it |
+| No limit on managed requests: each junk `/ws/id` or `/ws/relay` request cost a management call and an audit row | Medium | 60 per minute per client (IPv6 /64) in hbbs and hbbr, checked before the API call; bounded client table |
+| hbbs/hbbr silently ran as open stock servers when `MANAGEMENT_URL` was missing | Low | The server image sets `MANAGEMENT_REQUIRED=Y`; startup then fails instead |
+| An approved device could flood the activity log | Low | 120 reports per minute per device |
+| Managed devices still answered unauthenticated punch-hole and local-address requests (outbound connections to attacker-chosen addresses) | Low | Ignored in managed mode (`rendezvous_mediator.rs`) |
+| A console strategy could set a proxy, `disable-udp` or the device credential | Low | Added to the strategy blocklist (`hbbs_http/sync.rs`) |
+| A renamed Windows executable (`rustdesk-host=…,key=….exe`) could override the server and key | Low | Ignored in Relivo builds (`platform/windows.rs`); compiled only by the Windows CI |
 
-Tests: management 18, hbbs 21, hbbr 17, hbb_common 101, agent `management::`,
-protocol smoke, and the attack run above.
+Tests: management 21, hbbs 23, hbbr 20, hbb_common 101, agent `management::`,
+strategy and mediator tests, protocol smoke, and the attack run above.
 
 ## Remaining risks, by priority
 
-1. **Device registration is unauthenticated UDP (availability).** Anyone who sees
-   a device's registration packet can replay it from another address, or change
-   its key, so that connections to that device fail until it re-registers. No
-   access is gained (signature and pinning hold). Fix: register over the TCP/WSS
-   channel (`disable-udp=Y` in the packaged profile) and authenticate RegisterPk
-   with the device key. Needs a native Windows validation before release.
-2. **Windows: the device enrollment token is readable by local users of the PC**
-   through the agent IPC, and is stored in plaintext configuration. Impact is
-   limited (the token cannot connect to anything without a controller account
-   and a grant). Fix: never return it over IPC, refuse non-elevated writes, store
-   it with DPAPI. Needs a Windows test.
-3. **No rate limit on `/ws/id` and `/ws/relay`.** Junk requests each cost a
-   management call and an audit row. Fix: per-client limits at the proxy and in
-   hbbs, and a shorter pre-request timeout.
-4. **Revocation does not cut an active session.** Disabling a user or device
-   blocks new sessions only (documented V1 behaviour). Fix: periodic re-check in
-   hbbr.
-5. **Presence and enrollment oracles (low).** Online status of a known ID can be
+1. **Device registration is unauthenticated UDP (availability only).** Anyone who
+   sees a device's registration packet can replay it from another address, or
+   change its key, so that connections to that device fail until it re-registers.
+   No access is gained (signature and pinning hold). The open-source hbbs answers
+   RegisterPk over TCP with NOT_SUPPORT, so `disable-udp=Y` would stop every
+   device from registering; the fix is a protocol change (TCP/WSS registration
+   with a challenge signed by the device key) on both server and agent.
+2. **The logged-in user of a PC is trusted with the agent configuration.** This is
+   RustDesk's model: the same-session IPC already hands the UI the whole
+   configuration (`SyncConfig`), including the device key pair and the enrollment
+   token. Hiding only the token would be cosmetic. Impact of a stolen token is
+   limited (no connection without a controller account and a grant). A fix needs
+   an IPC redesign where only the service holds secrets.
+3. **Presence and enrollment oracles (low).** Online status of a known ID can be
    queried; hbbs reports "device offline" before authorization. Kept because the
-   agent peer list uses it.
-6. **Fail-open configuration (low).** hbbs/hbbr run as stock servers if
-   `MANAGEMENT_URL` is missing. Add an explicit "managed required" switch.
-7. **Inherited RustDesk channel design (low).** Both directions of the secure
+   agent peer list uses it; requests are now rate limited.
+4. **Inherited RustDesk channel design (low).** Both directions of the secure
    channel use counter nonces from 1 with one key; only the relay operator could
    observe both streams. Needs a protocol change on both ends.
-8. **Hygiene (low).** Approved devices can flood the audit log; failed sign-ins
-   are never pruned; `runtime/admin-password` stays on disk after bootstrap; a
-   renamed Windows executable can override the server (requires running an
-   attacker binary); `rustdesk://` links start a session without confirmation
-   (grants still enforced); the console strategy option list is a blocklist.
+5. **Owner decisions (low).** Retention of failed sign-in records; removing
+   `runtime/admin-password` after the administrator stored the password elsewhere;
+   a confirmation prompt for `rustdesk://` links (grants are enforced anyway).

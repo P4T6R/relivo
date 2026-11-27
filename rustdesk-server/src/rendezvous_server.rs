@@ -129,6 +129,7 @@ enum ManagedRefusal {
     DeviceNotApproved,
     DeviceIdentityChanged,
     ServiceUnavailable,
+    TooManyRequests,
 }
 
 impl ManagedRefusal {
@@ -145,6 +146,9 @@ impl ManagedRefusal {
             }
             Self::DeviceNotApproved => {
                 "Managed connection denied: the device is not enrolled or not approved in the Relivo console"
+            }
+            Self::TooManyRequests => {
+                "Managed connection denied: too many connection attempts from this address, wait a minute"
             }
             Self::DeviceIdentityChanged => {
                 "Managed connection denied: the device identity changed (reinstalled?), rotate its credential in the Relivo console"
@@ -829,6 +833,9 @@ impl RendezvousServer {
         use ManagedRefusal::*;
         if !ws {
             return Err((InvalidRequest, "not received through the TLS WebSocket proxy".to_owned()));
+        }
+        if !crate::management::allow_client_request(addr.ip()) {
+            return Err((TooManyRequests, "per-client request limit reached".to_owned()));
         }
         if request.id.is_empty() || request.id.len() > MAX_PEER_ID_LEN {
             return Err((InvalidRequest, format!("invalid target ID (length {})", request.id.len())));
@@ -1856,6 +1863,7 @@ mod tests {
             ManagedRefusal::NoAccess,
             ManagedRefusal::DeviceNotApproved,
             ManagedRefusal::DeviceIdentityChanged,
+            ManagedRefusal::TooManyRequests,
         ]
         .map(|r| r.reason());
         for (i, reason) in reasons.iter().enumerate() {

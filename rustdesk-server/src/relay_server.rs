@@ -513,6 +513,13 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         );
                         return;
                     }
+                    if !crate::management::allow_client_request(addr.ip()) {
+                        log::warn!(
+                            "Managed relay request {:?} to {:?} from {} refused: per-client request limit reached",
+                            uuid, target, ip
+                        );
+                        return;
+                    }
                     if let Err(err) = crate::management::claim(&rf.token, &rf.uuid, &rf.id).await {
                         match err {
                             crate::management::ManagementError::Denied(_) => log::warn!(
@@ -553,7 +560,10 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             peer.set_max_packet_length(usize::MAX);
                             stream.set_max_packet_length(usize::MAX);
                         }
-                        if let Err(err) = relay(addr, &mut stream, &mut peer, limiter, id.clone()).await
+                        let revoked = crate::management::enabled()
+                            .then(|| watch_access(rf.uuid.clone(), uuid.to_string(), target.to_string()));
+                        if let Err(err) =
+                            relay(addr, &mut stream, &mut peer, limiter, id.clone(), revoked).await
                         {
                             log::info!("Relay of {} closed: {}", addr, err);
                         } else {
@@ -607,13 +617,67 @@ fn short(value: &str) -> &str {
 }
 
 /// Forwards traffic in both directions while enforcing relay limits and timeouts.
+/// How often a running managed relay re-checks that its access is still granted.
+const ACCESS_RECHECK: Duration = Duration::from_secs(60);
+
+/// Re-checks a paired managed session with the management API every minute. The
+/// returned receiver fires once access is revoked (sign-in revoked, user or device
+/// disabled, grant removed, device credential rotated). An unavailable API does not
+/// end a running session; new sessions already fail closed. The task stops when the
+/// relay ends and drops the receiver.
+fn watch_access(
+    uuid: String,
+    log_uuid: String,
+    log_target: String,
+) -> hbb_common::tokio::sync::oneshot::Receiver<()> {
+    let (mut tx, rx) = hbb_common::tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sleep(ACCESS_RECHECK.as_secs_f32()) => {}
+                _ = tx.closed() => return,
+            }
+            match crate::management::event(&uuid, "active").await {
+                Err(crate::management::ManagementError::Denied(reason)) => {
+                    log::warn!(
+                        "Managed relay {:?} to {:?} ended: access revoked ({})",
+                        log_uuid, log_target, reason
+                    );
+                    tx.send(()).ok();
+                    return;
+                }
+                Err(err) => log::warn!(
+                    "Managed relay {:?} to {:?}: access re-check failed, session kept ({})",
+                    log_uuid, log_target, err
+                ),
+                Ok(()) => {}
+            }
+        }
+    });
+    rx
+}
+
 async fn relay(
     addr: SocketAddr,
     stream: &mut impl StreamTrait,
     peer: &mut Box<dyn StreamTrait>,
     total_limiter: Limiter,
     id: String,
+    revoked: Option<hbb_common::tokio::sync::oneshot::Receiver<()>>,
 ) -> ResultType<()> {
+    // Without management there is nothing to re-check: wait forever.
+    let mut revoked = revoked;
+    let revoked = async move {
+        match revoked.as_mut() {
+            Some(rx) => {
+                if rx.await.is_err() {
+                    std::future::pending::<()>().await
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(revoked);
     let ip = addr.ip().to_string();
     // The dual-stack listener reports an IPv4 client as ::ffff:a.b.c.d; lists may hold either form.
     let unmapped = hbb_common::try_into_v4(addr).ip().to_string();
@@ -676,6 +740,9 @@ async fn relay(
                 if last_recv_time.elapsed().as_secs() > 30 {
                     bail!("Timeout");
                 }
+            }
+            _ = &mut revoked => {
+                bail!("access revoked by the management API");
             }
         }
 
@@ -755,10 +822,54 @@ mod tests {
         });
         let result = timeout(35_000, relay(
             "127.0.0.1:1".parse().unwrap(), &mut stream, &mut peer,
-            Limiter::new(1_000_000.), "blocked-send-test".to_owned(),
+            Limiter::new(1_000_000.), "blocked-send-test".to_owned(), None,
         )).await.expect("a blocked relay write must finish within its deadline");
         let error = result.expect_err("the blocked write must fail");
         assert!(error.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+    }
+
+    /// A revocation from the management re-check ends an idle, otherwise healthy relay.
+    #[tokio::test]
+    async fn a_revoked_session_is_cut_off() {
+        let mut stream = TestStream { data: None, blocked: false };
+        let mut peer: Box<dyn StreamTrait> = Box::new(TestStream { data: None, blocked: false });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            sleep(0.2).await;
+            tx.send(()).ok();
+        });
+        let result = timeout(
+            2_000,
+            relay(
+                "127.0.0.1:1".parse().unwrap(),
+                &mut stream,
+                &mut peer,
+                Limiter::new(1_000_000.),
+                "revocation-test".to_owned(),
+                Some(rx),
+            ),
+        )
+        .await
+        .expect("the relay must end soon after revocation");
+        assert!(result.unwrap_err().to_string().contains("revoked"));
+        // A watcher that stops without revoking (relay ended elsewhere) cuts nothing.
+        let mut stream = TestStream { data: None, blocked: false };
+        let mut peer: Box<dyn StreamTrait> = Box::new(TestStream { data: None, blocked: false });
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let result = timeout(
+            1_000,
+            relay(
+                "127.0.0.1:1".parse().unwrap(),
+                &mut stream,
+                &mut peer,
+                Limiter::new(1_000_000.),
+                "dropped-watcher-test".to_owned(),
+                Some(rx),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "a dropped watcher must not end the relay");
     }
 
     /// Checks that stalled writes time out in either relay direction.
@@ -793,6 +904,7 @@ mod tests {
                     &mut peer,
                     Limiter::new(1_000_000.),
                     "blocklist-test".to_owned(),
+                    None,
                 ),
             )
             .await;

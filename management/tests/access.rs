@@ -322,6 +322,77 @@ async fn healthcheck_reports_database_unavailability() {
 }
 
 #[tokio::test]
+async fn a_running_session_ends_when_access_is_revoked() {
+    let h = Harness::new().await;
+    let (uid, operator) = h.user("support", "operator").await;
+    let device = h.device("111111", true).await;
+    let group = h.group("Support", vec![&uid], vec!["111111"]).await;
+    let grant = h.grant(&group, &group).await;
+    let uuid = "revoke-during-session-01";
+    for (identity, role) in [(&operator, "controller"), (&device, "device")] {
+        let ticket = h.ticket(identity, "111111", uuid, role).await;
+        let claim = json!({"uuid":uuid,"target":"111111","ticket":ticket["ticket"]});
+        assert_eq!(call(&h.private, "POST", "/relay/claim", &Identity::default(), claim).await.0, StatusCode::OK);
+    }
+    let event = |name: &'static str| {
+        let app = h.private.clone();
+        async move { call(&app, "POST", "/relay/event", &Identity::default(), json!({"uuid":uuid,"event":name})).await.0 }
+    };
+    assert_eq!(event("paired").await, StatusCode::OK);
+    // Still allowed: the re-check succeeds and writes no audit row.
+    assert_eq!(event("active").await, StatusCode::OK);
+    // Past the 8 h sign-in, a running session is kept (within the grace period).
+    sqlx::query("UPDATE sessions SET expires_at=strftime('%s','now')-60 WHERE kind='native'")
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(event("active").await, StatusCode::OK);
+    assert_eq!(h.api("GET", "/management/v1/audit?q=relay.revoked", Value::Null).await["total"], 0);
+    h.api("DELETE", &format!("/management/v1/grants/{grant}"), Value::Null).await;
+    assert_eq!(event("active").await, StatusCode::FORBIDDEN);
+    assert_eq!(h.api("GET", "/management/v1/audit?q=relay.revoked", Value::Null).await["total"], 1);
+    // An unknown session is never "active".
+    let unknown = call(&h.private, "POST", "/relay/event", &Identity::default(), json!({"uuid":"never-claimed-session-01","event":"active"})).await.0;
+    assert_eq!(unknown, StatusCode::FORBIDDEN);
+    drop(operator);
+}
+
+#[tokio::test]
+async fn a_disabled_device_ends_its_running_session() {
+    let h = Harness::new().await;
+    let (uid, operator) = h.user("support", "operator").await;
+    let device = h.device("111111", true).await;
+    let group = h.group("Support", vec![&uid], vec!["111111"]).await;
+    h.grant(&group, &group).await;
+    let uuid = "disable-during-session-1";
+    for (identity, role) in [(&operator, "controller"), (&device, "device")] {
+        let ticket = h.ticket(identity, "111111", uuid, role).await;
+        let claim = json!({"uuid":uuid,"target":"111111","ticket":ticket["ticket"]});
+        assert_eq!(call(&h.private, "POST", "/relay/claim", &Identity::default(), claim).await.0, StatusCode::OK);
+    }
+    let active = json!({"uuid":uuid,"event":"active"});
+    assert_eq!(call(&h.private, "POST", "/relay/event", &Identity::default(), active.clone()).await.0, StatusCode::OK);
+    h.api("PUT", "/management/v1/devices/111111", json!({"name":"Workstation","state":"disabled"})).await;
+    assert_eq!(call(&h.private, "POST", "/relay/event", &Identity::default(), active).await.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn device_activity_reports_are_rate_limited_per_device() {
+    let h = Harness::new().await;
+    let noisy = h.device("111111", true).await;
+    let quiet = h.device("222222", true).await;
+    let report = |id: &str, n: usize| json!({"id":id,"action":"new","nonce":format!("flood-test-nonce-{n:06}")});
+    for n in 0..120 {
+        assert_eq!(call(&h.app, "POST", "/api/audit/conn", &noisy, report("111111", n)).await.0, StatusCode::NO_CONTENT);
+    }
+    assert_eq!(call(&h.app, "POST", "/api/audit/conn", &noisy, report("111111", 120)).await.0, StatusCode::TOO_MANY_REQUESTS);
+    // Another device is not affected.
+    assert_eq!(call(&h.app, "POST", "/api/audit/conn", &quiet, report("222222", 0)).await.0, StatusCode::NO_CONTENT);
+    let log = h.api("GET", "/management/v1/audit?q=client.conn", Value::Null).await;
+    assert_eq!(log["total"], 121);
+}
+
+#[tokio::test]
 async fn revocation_between_admission_and_pairing_is_enforced() {
     let h = Harness::new().await;
     let (uid, operator) = h.user("support", "operator").await;

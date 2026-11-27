@@ -2172,6 +2172,13 @@ pub fn prepare_custom_client_update() -> ResultType<bool> {
 }
 
 pub fn get_license_from_exe_name() -> ResultType<CustomServer> {
+    // A Relivo build has its server, relay and key fixed by the packaged profile; a
+    // renamed executable such as `rustdesk-host=evil,key=....exe` must not override it.
+    #[cfg(feature = "relivo-managed")]
+    {
+        hbb_common::bail!("server settings in the executable name are ignored in Relivo builds");
+    }
+    #[allow(unreachable_code)]
     let mut exe = std::env::current_exe()?.to_str().unwrap_or("").to_owned();
     // if defined portable appname entry, replace original executable name with it.
     if let Ok(portable_exe) = std::env::var(PORTABLE_APPNAME_RUNTIME_ENV_KEY) {

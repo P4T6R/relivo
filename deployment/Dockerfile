@@ -49,6 +49,8 @@ ENTRYPOINT ["/usr/local/bin/rustdesk-management"]
 
 FROM runtime AS server
 COPY --from=rust-build /out/hbbs /out/hbbr /usr/local/bin/
+# Never fall back to an open, unmanaged server when MANAGEMENT_URL is missing.
+ENV MANAGEMENT_REQUIRED=Y
 CMD ["hbbs"]
 
 FROM caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee AS edge

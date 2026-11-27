@@ -15,6 +15,11 @@ pub(crate) fn init() -> ResultType<()> {
     MANAGER.get_or_try_init(|| -> ResultType<Option<Manager>> {
         let url = crate::common::get_arg("MANAGEMENT_URL");
         if url.is_empty() {
+            // The Relivo server image sets MANAGEMENT_REQUIRED=Y: a missing setting must
+            // stop the server rather than silently run an open, unmanaged one.
+            if crate::common::get_arg("MANAGEMENT_REQUIRED").eq_ignore_ascii_case("y") {
+                bail!("MANAGEMENT_REQUIRED=Y but MANAGEMENT_URL is not set; refusing to run unmanaged");
+            }
             return Ok(None);
         }
         let parsed = reqwest::Url::parse(&url)?;
@@ -67,6 +72,58 @@ fn manager() -> ResultType<&'static Manager> {
         .get()
         .and_then(Option::as_ref)
         .ok_or_else(|| hbb_common::anyhow::anyhow!("Management is not initialized"))
+}
+/// Managed requests (hbbs RequestRelay, hbbr relay joins) each cost a management call
+/// and an audit row; bound them per client before calling the API.
+const CLIENT_REQUESTS_PER_MINUTE: u32 = 60;
+const MAX_TRACKED_CLIENTS: usize = 100_000;
+static CLIENT_REQUESTS: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+> = once_cell::sync::Lazy::new(Default::default);
+
+/// One limit key per client; a whole IPv6 /64 is one client.
+fn client_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_default(),
+        IpAddr::V4(v4) => v4.to_string(),
+    }
+}
+
+/// Whether this client may send another managed request now (fixed one-minute window).
+pub(crate) fn allow_client_request(ip: IpAddr) -> bool {
+    allow_at(&mut CLIENT_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()), ip, std::time::Instant::now())
+}
+fn allow_at(
+    map: &mut std::collections::HashMap<String, (std::time::Instant, u32)>,
+    ip: IpAddr,
+    now: std::time::Instant,
+) -> bool {
+    let window = Duration::from_secs(60);
+    if map.len() >= MAX_TRACKED_CLIENTS {
+        map.retain(|_, (start, _)| now.duration_since(*start) < window);
+        if map.len() >= MAX_TRACKED_CLIENTS {
+            // Still full of active clients: refuse new ones rather than grow without bound.
+            return map.contains_key(&client_key(ip)) && allow_known(map, ip, now, window);
+        }
+    }
+    allow_known(map, ip, now, window)
+}
+fn allow_known(
+    map: &mut std::collections::HashMap<String, (std::time::Instant, u32)>,
+    ip: IpAddr,
+    now: std::time::Instant,
+    window: Duration,
+) -> bool {
+    let entry = map.entry(client_key(ip)).or_insert((now, 0));
+    if now.duration_since(entry.0) >= window {
+        *entry = (now, 0);
+    }
+    entry.1 += 1;
+    entry.1 <= CLIENT_REQUESTS_PER_MINUTE
 }
 pub(crate) fn relay_url() -> ResultType<String> {
     Ok(manager()?.relay.clone())
@@ -252,6 +309,43 @@ mod tests {
         ] {
             assert_eq!(refusal_detail(&value), None, "{value}");
         }
+    }
+
+    #[test]
+    fn managed_requests_are_bounded_per_client() {
+        let mut map = std::collections::HashMap::new();
+        let now = std::time::Instant::now();
+        let a: IpAddr = "203.0.113.5".parse().unwrap();
+        for _ in 0..CLIENT_REQUESTS_PER_MINUTE {
+            assert!(allow_at(&mut map, a, now));
+        }
+        assert!(!allow_at(&mut map, a, now));
+        // Other clients are unaffected, and the window resets after a minute.
+        assert!(allow_at(&mut map, "198.51.100.1".parse().unwrap(), now));
+        assert!(allow_at(&mut map, a, now + Duration::from_secs(61)));
+        // An IPv6 /64 is one client; an IPv4-mapped address is its IPv4 client.
+        let v6 = |s: &str| s.parse::<IpAddr>().unwrap();
+        for i in 0..CLIENT_REQUESTS_PER_MINUTE {
+            assert!(allow_at(&mut map, v6(&format!("2001:db8:1:2::{:x}", i + 1)), now));
+        }
+        assert!(!allow_at(&mut map, v6("2001:db8:1:2:ffff::1"), now));
+        assert!(allow_at(&mut map, v6("2001:db8:1:3::1"), now));
+        assert_eq!(client_key(v6("::ffff:203.0.113.5")), "203.0.113.5");
+    }
+
+    #[test]
+    fn the_client_table_cannot_grow_without_bound() {
+        let mut map = std::collections::HashMap::new();
+        let now = std::time::Instant::now();
+        for i in 0..MAX_TRACKED_CLIENTS as u32 {
+            map.insert(format!("c{i}"), (now, 1));
+        }
+        // A new client is refused while the table is full of active clients...
+        assert!(!allow_at(&mut map, "192.0.2.1".parse().unwrap(), now));
+        assert_eq!(map.len(), MAX_TRACKED_CLIENTS);
+        // ...and accepted once the old windows expired.
+        assert!(allow_at(&mut map, "192.0.2.1".parse().unwrap(), now + Duration::from_secs(61)));
+        assert_eq!(map.len(), 1);
     }
 
     #[hbb_common::tokio::test]

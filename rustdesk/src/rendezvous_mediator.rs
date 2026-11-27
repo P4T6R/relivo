@@ -576,6 +576,15 @@ impl RendezvousMediator {
                     log::info!("keep_alive: {}ms", self.keep_alive);
                 }
             }
+            // Managed devices accept sessions only through the managed relay; a punch hole
+            // or local-address request (unauthenticated UDP) would only make them connect
+            // to an address of the sender's choosing.
+            Some(rendezvous_message::Union::PunchHole(_))
+            | Some(rendezvous_message::Union::FetchLocalAddr(_))
+                if crate::management::enabled() =>
+            {
+                log::debug!("ignored punch hole / local address request: managed mode");
+            }
             Some(rendezvous_message::Union::PunchHole(ph)) => {
                 let rz = self.clone();
                 let server = server.clone();

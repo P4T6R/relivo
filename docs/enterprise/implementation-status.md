@@ -94,8 +94,9 @@ commands remain owner-run under the supplied MISHKAN instructions.
 
 ## Explicit V1 limits
 
-- No SSO, LDAP, 2FA, session recording, browser-based remote desktop, or immediate
-  termination of existing sessions. A grant revocation blocks new sessions.
+- No SSO, LDAP, 2FA, session recording or browser-based remote desktop. A grant
+  revocation blocks new sessions; a running relay session ends within about a
+  minute (hbbr re-check), not immediately.
 - The legacy address book is read-only and limited to the first 100 visible
   devices; larger inventories use the paginated device/group APIs or console.
 - Device names are administrator-assigned; platform and contact time come from

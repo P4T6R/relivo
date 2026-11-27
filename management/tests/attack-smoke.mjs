@@ -202,6 +202,22 @@ try {
   report('Operator creates grants', c.status === 403, `HTTP ${c.status}`);
   c = await call(`/management/v1/devices/${id2}/rotate`, { method: 'POST', ...opS }); console.log(`INFO | operator rotate device credential: HTTP ${c.status}`);
   c = await call('/management/v1/audit', { ...opS }); console.log(`INFO | operator reads audit: HTTP ${c.status}`);
+  // 14b. A running relay session is cut when the controller account is disabled
+  const live = randomUUID(); await authorize(tokOp, id, live);
+  const liveCtl = (await tk(tokOp, { target: id, uuid: live, role: 'controller' })).json.ticket;
+  const liveDev = (await tk(dev.credential, { target: id, uuid: live, role: 'device' })).json.ticket;
+  const la = await ws(22119); la.send(join(liveCtl, live));
+  const lb = await ws(22119); lb.send(join(liveDev, live)); await sleep(500);
+  la.send(Buffer.from('before-revocation'));
+  const before = await nextMsg(lb, 2000);
+  await A(`/management/v1/users/${op.id}`, 'PUT', { display_name: 'Op', role: 'operator', enabled: false });
+  const keepAlive = setInterval(() => { try { la.send(Buffer.from('k')); } catch {} }, 5000);
+  const cutAt = Date.now();
+  while (!(la.closed && lb.closed) && Date.now() - cutAt < 80000) await sleep(500);
+  clearInterval(keepAlive);
+  report('Running session survives revocation of the controller account', !!before && la.closed && lb.closed,
+    `paired=${!!before}, cut after ${Math.round((Date.now() - cutAt) / 1000)}s`);
+  await A(`/management/v1/users/${op.id}`, 'PUT', { display_name: 'Op', role: 'operator', enabled: true });
   // 15. Session revocation
   const lo = await call('/management/v1/session', { method: 'DELETE', ...opS }); console.log('INFO | logout HTTP', lo.status);
   c = await call('/management/v1/devices', { ...opS }); report('Console session reused after logout', c.status === 401, `HTTP ${c.status}`);
@@ -223,6 +239,14 @@ try {
   // 18. Enumeration through device token on another device report
   x = await call('/api/heartbeat', { method: 'POST', data: { id, uuid: uuid0, management_pk: pk2.toString('base64') }, token: dev2.credential });
   report('Device 2 token reports as device 1', x.status === 401 || x.status === 403, `HTTP ${x.status}`);
+  // 19. Flooding /ws/id with managed requests
+  let flood = null;
+  for (let i = 0; i < 70; i++) { const fr = await authorize('junk-token-' + i); if (fr?.[6]?.toString().includes('too many')) { flood = i; break; } }
+  report('Flood of RequestRelay on /ws/id is rate limited', flood !== null, flood === null ? 'never limited' : `limited after ${flood} requests`);
+  // 20. Misconfigured managed server must not start open
+  const open = spawnSync(resolve(root, 'rustdesk-server/target/debug/hbbs'), ['--bind', '127.0.0.1', '-p', '22216', '-k', '-'],
+    { cwd: work, env: { ...process.env, MANAGEMENT_REQUIRED: 'Y', MANAGEMENT_URL: '' }, timeout: 8000, encoding: 'utf8' });
+  report('hbbs without MANAGEMENT_URL while MANAGEMENT_REQUIRED=Y', open.status !== 0 && open.status !== null, `exit=${open.status} signal=${open.signal}`);
   const after = await authorize((await call('/api/login', { method: 'POST', data: { username: 'admin', password, type: 'account' } })).json?.access_token ?? '');
   console.log('INFO | admin authorize after attacks refuse=', after?.[6]?.toString() ?? '(granted)');
 } catch (e) { console.log('ERROR', e.stack); results.push({ name: 'run', ok: false }); }

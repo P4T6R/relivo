@@ -296,8 +296,19 @@ async fn credential_can_connect(
     hash: &str,
     target: &str,
 ) -> ApiResult<bool> {
+    credential_allowed_since(conn, hash, target, now()).await
+}
+/// How long an already paired relay may outlive its controller's sign-in expiry.
+pub(crate) const ACTIVE_RELAY_GRACE: i64 = 86_400;
+/// The grant check of `credential_can_connect`, for a sign-in valid after `since`.
+async fn credential_allowed_since(
+    conn: &mut sqlx::SqliteConnection,
+    hash: &str,
+    target: &str,
+    since: i64,
+) -> ApiResult<bool> {
     let count:i64=sqlx::query_scalar("SELECT count(*) FROM sessions s JOIN users u ON u.id=s.user_id JOIN devices d ON d.id=? WHERE s.token_hash=? AND s.kind='native' AND s.expires_at>? AND u.enabled=1 AND u.role IN ('admin','operator') AND d.state='approved' AND d.verified=1 AND (u.role='admin' OR EXISTS(SELECT 1 FROM user_groups ug JOIN grants g ON g.subject_group=ug.group_id JOIN device_groups dg ON dg.group_id=g.target_group WHERE ug.user_id=u.id AND dg.device_id=d.id AND g.capability='connect'))")
-        .bind(target).bind(hash).bind(now()).fetch_one(conn).await?;
+        .bind(target).bind(hash).bind(since).fetch_one(conn).await?;
     Ok(count > 0)
 }
 fn forbidden(reason: &'static str) -> ApiError {
@@ -570,12 +581,32 @@ pub(crate) async fn relay_event(
     State(s): State<AppState>,
     Json(input): Json<RelayEvent>,
 ) -> ApiResult<Json<Value>> {
-    if !["paired", "ended"].contains(&input.event.as_str()) {
+    if !["paired", "active", "ended"].contains(&input.event.as_str()) {
         return Err(invalid("Unknown relay event"));
     }
     let mut tx = s.db.begin().await?;
     let target:Option<String>=sqlx::query_scalar("SELECT device_id FROM relay_attempts WHERE uuid=? AND controller_claimed=1 AND device_claimed=1").bind(&input.uuid).fetch_optional(&mut *tx).await?;
     let target = target.ok_or_else(denied)?;
+    if input.event == "active" {
+        // hbbr re-checks a running session: a revoked sign-in or grant, a disabled user
+        // or device, or a rotated device credential ends it. Only the end is audited.
+        let (controller, device): (String, String) = sqlx::query_as(
+            "SELECT controller_hash,device_hash FROM relay_attempts WHERE uuid=?",
+        )
+        .bind(&input.uuid)
+        .fetch_one(&mut *tx)
+        .await?;
+        let valid_device:i64=sqlx::query_scalar("SELECT count(*) FROM devices WHERE id=? AND credential_hash=? AND state='approved' AND verified=1").bind(&target).bind(device).fetch_one(&mut *tx).await?;
+        if valid_device > 0
+            && credential_allowed_since(&mut tx, &controller, &target, now() - ACTIVE_RELAY_GRACE)
+                .await?
+        {
+            return Ok(Json(json!({"ok":true})));
+        }
+        audit(&mut tx, "relay", "relay.revoked", &target, "denied", "relay", &input.uuid).await?;
+        tx.commit().await?;
+        return Err(denied());
+    }
     if input.event == "paired" {
         let (controller, device, expires): (String, String, i64) = sqlx::query_as(
             "SELECT controller_hash,device_hash,expires_at FROM relay_attempts WHERE uuid=?",
@@ -604,6 +635,8 @@ pub(crate) async fn relay_event(
     tx.commit().await?;
     Ok(Json(json!({"ok":true})))
 }
+/// Activity reports one approved device may add per minute.
+const CLIENT_AUDIT_PER_MINUTE: i64 = 120;
 pub(crate) async fn client_audit(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -626,6 +659,22 @@ pub(crate) async fn client_audit(
     .await?;
     if count == 0 {
         return Err(denied());
+    }
+    // A compromised device must not bury real events or fill the disk.
+    sqlx::query("DELETE FROM login_limits WHERE resets_at<=?")
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    let bucket = format!("client-audit:{}", auth::digest(id));
+    sqlx::query("INSERT INTO login_limits(bucket,count,resets_at) VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=count+1")
+        .bind(&bucket).bind(now() + 60).execute(&mut *tx).await?;
+    let reports: i64 = sqlx::query_scalar("SELECT count FROM login_limits WHERE bucket=?")
+        .bind(&bucket)
+        .fetch_one(&mut *tx)
+        .await?;
+    if reports > CLIENT_AUDIT_PER_MINUTE {
+        tx.commit().await?;
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "Too many activity reports"));
     }
     if let Some(nonce) = body["nonce"].as_str() {
         relay_uuid(nonce)?;

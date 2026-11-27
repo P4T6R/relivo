@@ -308,8 +308,11 @@ async fn login(s: &AppState, raw: Bytes, ip: &str, kind: &str) -> ApiResult<(Pri
     let token = random_token();
     let hash = digest(&token);
     let csrf = random_token();
+    // Expired rows stay a day (every lookup still requires expires_at>now): an active
+    // relay session then outlives the 8 h sign-in, while a logout, disable or password
+    // change, which delete the row, still ends it (native::relay_event "active").
     sqlx::query("DELETE FROM sessions WHERE expires_at<=?")
-        .bind(now())
+        .bind(now() - crate::native::ACTIVE_RELAY_GRACE)
         .execute(&mut *tx)
         .await?;
     // A password reset or disable may happen while Argon2 runs; re-check the account.

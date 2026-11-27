@@ -95,7 +95,8 @@ paths are rejected by the modified client while managed mode is enabled.
 
 The operating-system administrator can still change configuration or replace the
 binary. This is an endpoint administration boundary, not tamper resistance.
-Revocation blocks new sessions; V1 does not forcibly terminate existing sessions.
+Revocation blocks new sessions. A running relay session is re-checked every minute and
+ends when the sign-in, grant, user or device is revoked (not when the API is unreachable).
 
 ## Production preparation (owner-run)
 
