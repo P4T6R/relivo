@@ -570,6 +570,17 @@ td strong {
   letter-spacing: 0.4px;
   margin-top: 5px;
 }
+.device-warning {
+  display: block;
+  max-width: 340px;
+  margin-top: 6px;
+  font-size: 9px;
+  line-height: 1.5;
+  color: #a48b50;
+}
+.device-warning.critical {
+  color: #a95750;
+}
 .device-icon {
   display: grid;
   place-items: center;

@@ -15,7 +15,8 @@ CREATE TABLE devices (
  state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','approved','disabled')),
  credential_hash TEXT NOT NULL UNIQUE, uuid TEXT NOT NULL DEFAULT '',
  public_key TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 0,
- last_seen INTEGER, created_at INTEGER NOT NULL, note TEXT NOT NULL DEFAULT ''
+ last_seen INTEGER, created_at INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '',
+ last_rejected_at INTEGER, last_rejection TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE groups (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE);
 CREATE TABLE user_groups (
@@ -54,4 +55,4 @@ CREATE TABLE relay_tickets (
  credential_hash TEXT NOT NULL, expires_at INTEGER NOT NULL
 );
 CREATE TABLE login_limits (bucket TEXT PRIMARY KEY, count INTEGER NOT NULL, resets_at INTEGER NOT NULL);
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

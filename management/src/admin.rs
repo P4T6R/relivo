@@ -64,6 +64,10 @@ pub(crate) struct Device {
     pub created_at: i64,
     pub note: String,
     pub public_key: String,
+    /// Latest refused report from the holder of this device's credential.
+    pub last_rejected_at: Option<i64>,
+    /// `id_mismatch`, `uuid`, `public_key`, `uuid_public_key`, `disabled` or empty.
+    pub last_rejection: String,
 }
 #[derive(Serialize, FromRow)]
 pub(crate) struct Group {
@@ -73,7 +77,7 @@ pub(crate) struct Group {
 
 pub(crate) const DEVICE_SCOPE:&str = "(?='admin' OR EXISTS (SELECT 1 FROM user_groups ug JOIN grants g ON g.subject_group=ug.group_id JOIN device_groups dg ON dg.group_id=g.target_group WHERE ug.user_id=? AND dg.device_id=d.id))";
 const DEVICE_COLUMNS: &str =
-    "d.id,d.name,d.platform,d.state,d.verified,d.last_seen,d.created_at,d.note,d.public_key";
+    "d.id,d.name,d.platform,d.state,d.verified,d.last_seen,d.created_at,d.note,d.public_key,d.last_rejected_at,d.last_rejection";
 
 pub(crate) async fn can_access(
     db: &SqlitePool,
@@ -293,10 +297,9 @@ pub(crate) async fn device(
 pub(crate) struct DeviceInput {
     id: Option<String>,
     name: String,
-    #[serde(default)]
-    platform: String,
-    #[serde(default)]
-    note: String,
+    // Absent fields keep their stored value on update (empty on create).
+    platform: Option<String>,
+    note: Option<String>,
     state: Option<String>,
 }
 pub(crate) async fn create_device(
@@ -308,7 +311,9 @@ pub(crate) async fn create_device(
     let id = input.id.ok_or_else(|| invalid("Device ID required"))?;
     device_id(&id)?;
     text(&input.name, 120)?;
-    if input.platform.len() > 120 || input.note.len() > 512 {
+    let platform = input.platform.unwrap_or_default();
+    let note = input.note.unwrap_or_default();
+    if platform.len() > 120 || note.len() > 512 {
         return Err(invalid("Device details too long"));
     }
     let credential = auth::random_token();
@@ -318,8 +323,8 @@ pub(crate) async fn create_device(
     )
     .bind(&id)
     .bind(input.name.trim())
-    .bind(input.platform)
-    .bind(input.note)
+    .bind(platform)
+    .bind(note)
     .bind(auth::digest(&credential))
     .bind(now())
     .execute(&mut *tx)
@@ -345,19 +350,25 @@ pub(crate) async fn update_device(
 ) -> ApiResult<Json<Value>> {
     p.admin()?;
     text(&input.name, 120)?;
-    if input.platform.len() > 120 || input.note.len() > 512 {
+    if input.platform.as_ref().is_some_and(|v| v.len() > 120)
+        || input.note.as_ref().is_some_and(|v| v.len() > 512)
+    {
         return Err(invalid("Device details too long"));
     }
-    let state = input.state.unwrap_or_else(|| "pending".into());
+    let mut tx = s.db.begin().await?;
+    let (verified, current, platform, note): (bool, String, String, String) =
+        sqlx::query_as("SELECT verified,state,platform,note FROM devices WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(not_found)?;
+    // A partial update must not silently move an approved device back to pending.
+    let state = input.state.unwrap_or(current);
     if !["pending", "approved", "disabled"].contains(&state.as_str()) {
         return Err(invalid("Invalid device state"));
     }
-    let mut tx = s.db.begin().await?;
-    let verified: bool = sqlx::query_scalar("SELECT verified FROM devices WHERE id=?")
-        .bind(&id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(not_found)?;
+    let platform = input.platform.unwrap_or(platform);
+    let note = input.note.unwrap_or(note);
     if state == "approved" && !verified {
         return Err(invalid(
             "The device must report with its enrollment credential before approval",
@@ -365,8 +376,8 @@ pub(crate) async fn update_device(
     }
     sqlx::query("UPDATE devices SET name=?,platform=?,note=?,state=? WHERE id=?")
         .bind(input.name.trim())
-        .bind(input.platform)
-        .bind(input.note)
+        .bind(platform)
+        .bind(note)
         .bind(&state)
         .bind(&id)
         .execute(&mut *tx)
@@ -392,7 +403,7 @@ pub(crate) async fn rotate_device_credential(
     p.admin()?;
     let credential = auth::random_token();
     let mut tx = s.db.begin().await?;
-    let result=sqlx::query("UPDATE devices SET credential_hash=?,uuid='',public_key='',verified=0,state='pending',last_seen=NULL WHERE id=?").bind(auth::digest(&credential)).bind(&id).execute(&mut *tx).await?;
+    let result=sqlx::query("UPDATE devices SET credential_hash=?,uuid='',public_key='',verified=0,state='pending',last_seen=NULL,last_rejected_at=NULL,last_rejection='' WHERE id=?").bind(auth::digest(&credential)).bind(&id).execute(&mut *tx).await?;
     if result.rows_affected() == 0 {
         return Err(not_found());
     }

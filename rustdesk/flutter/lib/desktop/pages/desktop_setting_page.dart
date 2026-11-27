@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/widgets/audio_input.dart';
+import 'package:flutter_hbb/common/widgets/relivo_enrollment.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
@@ -2285,9 +2286,73 @@ class _AccountState extends State<_Account> {
     return ListView(
       controller: scrollController,
       children: [
+        if (isRelivoManagementRequired()) relivoEnrollment(context),
         _Card(title: 'Account', children: [accountAction(), useInfo()]),
       ],
     ).marginOnly(bottom: _kListViewBottomMargin);
+  }
+
+  // Never shows the stored token, only whether one is present.
+  Widget relivoEnrollment(BuildContext context) {
+    final idController = gFFI.serverModel.serverId;
+    return _Card(title: kRelivoEnrollmentTitle, children: [
+      Row(
+        children: [
+          Text('${translate('ID')}: '),
+          Expanded(
+            child: ValueListenableBuilder<TextEditingValue>(
+              valueListenable: idController,
+              builder: (context, value, child) => SelectableText(
+                value.text,
+                maxLines: 1,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+          ),
+          IconButton(
+            tooltip: translate('Copy'),
+            icon: const Icon(Icons.copy, size: 18),
+            onPressed: () async {
+              final id = await bind.mainGetMyId();
+              if (id.isEmpty) {
+                return;
+              }
+              await Clipboard.setData(ClipboardData(text: id));
+              showToast(translate('Copied'));
+            },
+          ),
+        ],
+      ).marginOnly(left: _kContentHMargin),
+      Obx(() {
+        final enrolled = relivoDeviceEnrolled.value;
+        final color = enrolled ? Colors.green : Colors.orange.shade700;
+        return Row(
+          children: [
+            Icon(
+              enrolled ? Icons.check_circle : Icons.warning_amber_rounded,
+              size: 18,
+              color: color,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                translate(
+                    enrolled ? kRelivoEnrolledLabel : kRelivoNotEnrolledLabel),
+                style: TextStyle(color: enrolled ? null : color),
+              ),
+            ),
+          ],
+        ).marginOnly(left: _kContentHMargin, bottom: 6);
+      }),
+      _Button(kRelivoEnterTokenButton, showRelivoEnrollmentDialog),
+      Text(
+        translate(kRelivoEnrollmentHelp),
+        style: TextStyle(
+          fontSize: 13,
+          color: Theme.of(context).textTheme.bodySmall?.color,
+        ),
+      ).marginOnly(left: _kContentHMargin, top: 6),
+    ]);
   }
 
   Widget accountAction() {

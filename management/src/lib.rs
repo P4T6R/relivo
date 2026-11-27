@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{any, delete, get, post, put},
     Json, Router,
 };
 use serde::Serialize;
@@ -108,11 +108,70 @@ pub async fn open_database(path: &Path) -> anyhow::Result<SqlitePool> {
         tx.commit().await?;
     } else {
         anyhow::ensure!(
-            version == 1,
+            (1..=SCHEMA_VERSION).contains(&version),
             "Unsupported database schema; run the documented owner-managed upgrade"
         );
+        if version < SCHEMA_VERSION {
+            migrate(&db, path, version).await?;
+        }
     }
     Ok(db)
+}
+
+const SCHEMA_VERSION: i64 = 2;
+
+/// Upgrades a known older schema in place. Each step only adds columns, runs in
+/// one transaction (schema change and `user_version` commit together or not at
+/// all), and is preceded by a consistent `VACUUM INTO` copy of the database.
+async fn migrate(db: &SqlitePool, path: &Path, from: i64) -> anyhow::Result<()> {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!(".pre-v{SCHEMA_VERSION}-{}.bak", now()));
+    let backup = PathBuf::from(backup);
+    anyhow::ensure!(
+        !backup.exists(),
+        "Refusing to overwrite an existing pre-migration backup"
+    );
+    sqlx::query("VACUUM INTO ?")
+        .bind(backup.to_string_lossy().into_owned())
+        .execute(db)
+        .await
+        .map_err(|e| anyhow::anyhow!("Pre-migration backup failed; database left unchanged: {e}"))?;
+    // The copy holds the same credential hashes: keep the database's permissions.
+    std::fs::set_permissions(&backup, std::fs::metadata(path)?.permissions())?;
+    eprintln!(
+        "Management schema upgrade v{from} -> v{SCHEMA_VERSION}; backup: {}",
+        backup.display()
+    );
+    let mut tx = db.begin().await?;
+    // Re-read inside the write transaction so a concurrent start cannot apply a step twice.
+    let current: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *tx)
+        .await?;
+    if current == 1 {
+        for (column, definition) in [
+            ("last_rejected_at", "INTEGER"),
+            ("last_rejection", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pragma_table_info('devices') WHERE name=?",
+            )
+            .bind(column)
+            .fetch_one(&mut *tx)
+            .await?;
+            if exists == 0 {
+                sqlx::raw_sql(&format!(
+                    "ALTER TABLE devices ADD COLUMN {column} {definition}"
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::raw_sql("PRAGMA user_version = 2")
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn create_admin(db: &SqlitePool, username: &str, password: &str) -> anyhow::Result<()> {
@@ -230,10 +289,7 @@ pub fn public_router(state: AppState, web: Option<PathBuf>) -> Router {
         .route("/api/device-group/accessible", get(native::groups))
         .route("/api/heartbeat", post(native::heartbeat))
         .route("/api/sysinfo", post(native::sysinfo))
-        .route(
-            "/api/sysinfo_ver",
-            post(|| async { Json(serde_json::json!({"version":"1"})) }),
-        )
+        .route("/api/sysinfo_ver", post(native::sysinfo_version))
         .route("/api/management/relay-ticket", post(native::relay_ticket))
         .route("/api/audit/{kind}", post(native::client_audit))
         .route(
@@ -244,7 +300,10 @@ pub fn public_router(state: AppState, web: Option<PathBuf>) -> Router {
                     "This address book is managed in the web console",
                 )
             }),
-        );
+        )
+        // The native client probes the shared address book API here; 404 selects
+        // its legacy mode instead of an "HTTP 405" error from the static files.
+        .route("/api/ab/{*rest}", any(|| async { not_found() }));
     if let Some(web) = web {
         app = app.fallback_service(ServeDir::new(&web));
     }

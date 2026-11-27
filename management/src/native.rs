@@ -1,6 +1,6 @@
 use crate::{
     admin::{self, Page},
-    audit, auth, denied, invalid, now, unauthorized, ApiResult, AppState,
+    audit, auth, denied, invalid, now, ApiError, ApiResult, AppState,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -10,6 +10,7 @@ use axum::{
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 pub(crate) async fn current_user(
     State(s): State<AppState>,
@@ -72,21 +73,115 @@ pub(crate) async fn heartbeat(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    device_report(&s, &headers, body, false).await
+    device_report(&s, &headers, body, false).await?;
+    Ok(Json(json!({"modified_at":0,"version":"1"})))
 }
+/// The RustDesk client compares this body with the literal `SYSINFO_UPDATED`;
+/// any other 2xx body makes it re-upload system information indefinitely.
 pub(crate) async fn sysinfo(
     State(s): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> ApiResult<Json<Value>> {
-    device_report(&s, &headers, body, true).await
+) -> ApiResult<&'static str> {
+    device_report(&s, &headers, body, true).await?;
+    Ok("SYSINFO_UPDATED")
+}
+/// The client posts an empty body and compares the raw response with the
+/// version it stored after its last accepted upload. The value is derived from
+/// the credential, so re-enrollment with a rotated credential forces an upload.
+pub(crate) async fn sysinfo_version(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<String> {
+    let credential = auth::digest(auth::bearer(&headers)?);
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM devices WHERE credential_hash=?")
+            .bind(&credential)
+            .fetch_optional(&s.db)
+            .await?;
+    match state.as_deref() {
+        None => Err(ApiError(StatusCode::UNAUTHORIZED, "device credential invalid")),
+        Some("disabled") => Err(ApiError(StatusCode::FORBIDDEN, "device disabled")),
+        Some(_) => Ok(format!(
+            "1-{}",
+            &auth::digest(&format!("sysinfo:{credential}"))[..16]
+        )),
+    }
+}
+
+/// A rejected agent retries every ~15 s; record at most one audit event per
+/// device and reason in this window. The device row always holds the latest one.
+const REJECTION_AUDIT_WINDOW: i64 = 600;
+/// Unauthenticated rejections are only logged, globally limited to one line per minute.
+static LAST_UNKNOWN_LOG: AtomicI64 = AtomicI64::new(0);
+static UNKNOWN_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+fn log_unknown_credential(reported_id: &str) {
+    let t = now();
+    let last = LAST_UNKNOWN_LOG.load(Ordering::Relaxed);
+    if t - last < 60
+        || LAST_UNKNOWN_LOG
+            .compare_exchange(last, t, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        UNKNOWN_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let suppressed = UNKNOWN_SUPPRESSED.swap(0, Ordering::Relaxed);
+    // `reported_id` has passed `admin::device_id` (ASCII alphanumerics, `_`, `-`).
+    eprintln!(
+        "Device report rejected: unknown enrollment credential (reported ID {reported_id}; {suppressed} similar rejection(s) not logged)"
+    );
+}
+
+#[derive(sqlx::FromRow)]
+struct ReportingDevice {
+    id: String,
+    uuid: String,
+    public_key: String,
+    state: String,
+    verified: bool,
+    last_rejected_at: Option<i64>,
+    last_rejection: String,
+}
+/// Stores the rejection on the device that owns the presented credential and
+/// audits identity problems, de-duplicated per `REJECTION_AUDIT_WINDOW`.
+async fn reject_report(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    device: &ReportingDevice,
+    reason: &str,
+    detail: Option<String>,
+) -> ApiResult<()> {
+    let t = now();
+    let recently_recorded = device.last_rejection == reason
+        && device
+            .last_rejected_at
+            .is_some_and(|at| t - at < REJECTION_AUDIT_WINDOW);
+    sqlx::query("UPDATE devices SET last_rejected_at=?,last_rejection=? WHERE id=?")
+        .bind(t)
+        .bind(reason)
+        .bind(&device.id)
+        .execute(&mut **tx)
+        .await?;
+    if let Some(detail) = detail.filter(|_| !recently_recorded) {
+        audit(
+            tx,
+            &device.id,
+            "device.identity_mismatch",
+            &device.id,
+            "denied",
+            "device credential",
+            &detail,
+        )
+        .await?;
+    }
+    Ok(())
 }
 async fn device_report(
     s: &AppState,
     headers: &HeaderMap,
     body: Value,
     sysinfo: bool,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<()> {
     let credential = auth::digest(auth::bearer(headers)?);
     let id = body["id"]
         .as_str()
@@ -107,40 +202,80 @@ async fn device_report(
     if pk_bytes.len() != 32 {
         return Err(invalid("Invalid device public key"));
     }
-    let mut tx = s.db.begin().await?;
-    let device: Option<(String, String, String, bool)> = sqlx::query_as(
-        "SELECT uuid,public_key,state,verified FROM devices WHERE id=? AND credential_hash=?",
-    )
-    .bind(id)
-    .bind(&credential)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let (old_uuid, old_pk, state, verified) = device.ok_or_else(unauthorized)?;
-    if state == "disabled"
-        || (!old_uuid.is_empty() && old_uuid != uuid)
-        || (!old_pk.is_empty() && old_pk != pk)
-    {
-        return Err(denied());
-    }
-    sqlx::query("UPDATE devices SET uuid=?,public_key=?,verified=1,last_seen=? WHERE id=?")
-        .bind(uuid)
-        .bind(pk)
-        .bind(now())
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    if sysinfo {
+    let platform = if sysinfo {
         let platform = body["os"].as_str().unwrap_or("");
         if platform.len() > 120 {
             return Err(invalid("OS description too long"));
         }
-        sqlx::query("UPDATE devices SET platform=? WHERE id=?")
-            .bind(platform)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        Some(platform)
+    } else {
+        None
+    };
+    let mut tx = s.db.begin().await?;
+    // The credential hash is unique: it identifies the enrolled record even when
+    // the agent reports another ID, which is the usual misconfiguration.
+    let device: Option<ReportingDevice> = sqlx::query_as(
+        "SELECT id,uuid,public_key,state,verified,last_rejected_at,last_rejection FROM devices WHERE credential_hash=?",
+    )
+    .bind(&credential)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(device) = device else {
+        drop(tx);
+        log_unknown_credential(id);
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "device credential invalid"));
+    };
+    if device.id != id {
+        reject_report(
+            &mut tx,
+            &device,
+            "id_mismatch",
+            Some(format!(
+                "This device's credential was presented with another device ID ({id}); install it on the matching computer"
+            )),
+        )
+        .await?;
+        tx.commit().await?;
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "device ID does not match the credential"));
     }
-    if !verified {
+    if device.state == "disabled" {
+        reject_report(&mut tx, &device, "disabled", None).await?;
+        tx.commit().await?;
+        return Err(ApiError(StatusCode::FORBIDDEN, "device disabled"));
+    }
+    let uuid_changed = !device.uuid.is_empty() && device.uuid != uuid;
+    let pk_changed = !device.public_key.is_empty() && device.public_key != pk;
+    if uuid_changed || pk_changed {
+        let (reason, what) = match (uuid_changed, pk_changed) {
+            (true, true) => ("uuid_public_key", "UUID and public key"),
+            (true, false) => ("uuid", "UUID"),
+            _ => ("public_key", "public key"),
+        };
+        reject_report(
+            &mut tx,
+            &device,
+            reason,
+            Some(format!(
+                "Agent {what} differs from the pinned identity (reinstalled agent?); rotate the credential and re-enroll"
+            )),
+        )
+        .await?;
+        tx.commit().await?;
+        return Err(ApiError(StatusCode::FORBIDDEN, "device identity changed; re-enrollment required"));
+    }
+    // Clear a stale rejection once the conflicting agent has been quiet for a full
+    // window; a second agent still using the credential keeps it visible.
+    sqlx::query("UPDATE devices SET uuid=?,public_key=?,verified=1,last_seen=?,platform=coalesce(?,platform),last_rejection=CASE WHEN last_rejected_at IS NULL OR last_rejected_at<=? THEN '' ELSE last_rejection END,last_rejected_at=CASE WHEN last_rejected_at IS NULL OR last_rejected_at<=? THEN NULL ELSE last_rejected_at END WHERE id=?")
+        .bind(uuid)
+        .bind(pk)
+        .bind(now())
+        .bind(platform)
+        .bind(now() - REJECTION_AUDIT_WINDOW)
+        .bind(now() - REJECTION_AUDIT_WINDOW)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if !device.verified {
         audit(
             &mut tx,
             id,
@@ -153,7 +288,7 @@ async fn device_report(
         .await?;
     }
     tx.commit().await?;
-    Ok(Json(json!({"modified_at":0,"version":"1"})))
+    Ok(())
 }
 
 async fn credential_can_connect(
@@ -164,6 +299,58 @@ async fn credential_can_connect(
     let count:i64=sqlx::query_scalar("SELECT count(*) FROM sessions s JOIN users u ON u.id=s.user_id JOIN devices d ON d.id=? WHERE s.token_hash=? AND s.kind='native' AND s.expires_at>? AND u.enabled=1 AND u.role IN ('admin','operator') AND d.state='approved' AND d.verified=1 AND (u.role='admin' OR EXISTS(SELECT 1 FROM user_groups ug JOIN grants g ON g.subject_group=ug.group_id JOIN device_groups dg ON dg.group_id=g.target_group WHERE ug.user_id=u.id AND dg.device_id=d.id AND g.capability='connect'))")
         .bind(target).bind(hash).bind(now()).fetch_one(conn).await?;
     Ok(count > 0)
+}
+fn forbidden(reason: &'static str) -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, reason)
+}
+fn device_state_denial(state: &str, verified: bool) -> Option<ApiError> {
+    if !verified {
+        Some(forbidden("device not verified"))
+    } else if state == "disabled" {
+        Some(forbidden("device disabled"))
+    } else if state != "approved" {
+        Some(forbidden("device not approved"))
+    } else {
+        None
+    }
+}
+/// `None` when the native session may connect to `target`. `credential_can_connect`
+/// stays the only allow decision; the rest only explains a refusal. A user without
+/// a connect grant learns nothing about the target's existence or state.
+async fn controller_denial(
+    conn: &mut sqlx::SqliteConnection,
+    hash: &str,
+    target: &str,
+) -> ApiResult<Option<ApiError>> {
+    if credential_can_connect(&mut *conn, hash, target).await? {
+        return Ok(None);
+    }
+    let user: Option<(String, String)> = sqlx::query_as("SELECT u.id,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.kind='native' AND s.expires_at>? AND u.enabled=1")
+        .bind(hash).bind(now()).fetch_optional(&mut *conn).await?;
+    let Some((user_id, role)) = user else {
+        return Ok(Some(ApiError(StatusCode::UNAUTHORIZED, "session expired")));
+    };
+    if role == "viewer" {
+        return Ok(Some(forbidden("viewer role cannot connect")));
+    }
+    if role != "admin" {
+        let granted:i64=sqlx::query_scalar("SELECT count(*) FROM user_groups ug JOIN grants g ON g.subject_group=ug.group_id JOIN device_groups dg ON dg.group_id=g.target_group WHERE ug.user_id=? AND dg.device_id=? AND g.capability='connect'")
+            .bind(&user_id).bind(target).fetch_one(&mut *conn).await?;
+        if granted == 0 {
+            return Ok(Some(forbidden("no connect grant")));
+        }
+    }
+    let device: Option<(String, bool)> =
+        sqlx::query_as("SELECT state,verified FROM devices WHERE id=?")
+            .bind(target)
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(Some(match device {
+        None => forbidden("device not enrolled"),
+        Some((state, verified)) => {
+            device_state_denial(&state, verified).unwrap_or_else(denied)
+        }
+    }))
 }
 #[derive(Deserialize)]
 pub(crate) struct Authorization {
@@ -192,23 +379,35 @@ pub(crate) async fn authorize(
         .bind(&input.target)
         .fetch_optional(&mut *tx)
         .await?;
-    let allowed = input.conn_type == 0
-        && !input.public_key.is_empty()
-        && pk.as_deref() == Some(input.public_key.as_str())
-        && credential_can_connect(&mut tx, &hash, &input.target).await?;
+    let denial = if input.conn_type != 0 {
+        Some(forbidden("connection type not allowed"))
+    } else if input.token.is_empty() {
+        Some(ApiError(StatusCode::UNAUTHORIZED, "sign in required"))
+    } else if let Some(denial) = controller_denial(&mut tx, &hash, &input.target).await? {
+        Some(denial)
+    } else if input.public_key.is_empty() || pk.as_deref() != Some(input.public_key.as_str()) {
+        Some(forbidden("device identity mismatch"))
+    } else {
+        None
+    };
+    // The detail holds the attempt ID and a fixed reason string, never the token.
+    let detail = match &denial {
+        Some(e) => format!("{}: {}", input.attempt, e.1),
+        None => input.attempt.clone(),
+    };
     audit(
         &mut tx,
         actor.as_deref().unwrap_or("unauthenticated"),
         "connection.authorize",
         &input.target,
-        if allowed { "allowed" } else { "denied" },
+        if denial.is_none() { "allowed" } else { "denied" },
         "rendezvous",
-        &input.attempt,
+        &detail,
     )
     .await?;
     tx.commit().await?;
-    if !allowed {
-        return Err(denied());
+    if let Some(denial) = denial {
+        return Err(denial);
     }
     Ok(Json(json!({"allowed":true,"attempt":input.attempt})))
 }
@@ -241,14 +440,23 @@ pub(crate) async fn relay_ticket(
     }
     let credential = auth::digest(auth::bearer(&headers)?);
     let mut tx = s.db.begin().await?;
-    let allowed = if input.role == "controller" {
-        credential_can_connect(&mut tx, &credential, &input.target).await?
+    let denial = if input.role == "controller" {
+        controller_denial(&mut tx, &credential, &input.target).await?
     } else {
-        sqlx::query_scalar::<_,i64>("SELECT count(*) FROM devices WHERE id=? AND credential_hash=? AND state='approved' AND verified=1")
-            .bind(&input.target).bind(&credential).fetch_one(&mut *tx).await?>0
+        let device: Option<(String, bool)> = sqlx::query_as(
+            "SELECT state,verified FROM devices WHERE id=? AND credential_hash=?",
+        )
+        .bind(&input.target)
+        .bind(&credential)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match device {
+            None => Some(ApiError(StatusCode::UNAUTHORIZED, "device credential invalid")),
+            Some((state, verified)) => device_state_denial(&state, verified),
+        }
     };
-    if !allowed {
-        return Err(denied());
+    if let Some(denial) = denial {
+        return Err(denial);
     }
     sqlx::query("DELETE FROM relay_tickets WHERE expires_at<=?")
         .bind(now())
@@ -257,12 +465,14 @@ pub(crate) async fn relay_ticket(
     sqlx::query("DELETE FROM relay_attempts WHERE expires_at<=? AND uuid NOT IN(SELECT uuid FROM relay_tickets)").bind(now()-86400).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO relay_attempts(uuid,device_id,expires_at) VALUES(?,?,?) ON CONFLICT(uuid) DO NOTHING").bind(&input.uuid).bind(&input.target).bind(now()+60).execute(&mut *tx).await?;
     let (target,expiry,controller,device):(String,i64,i64,i64)=sqlx::query_as("SELECT device_id,expires_at,controller_claimed,device_claimed FROM relay_attempts WHERE uuid=?").bind(&input.uuid).fetch_one(&mut *tx).await?;
-    if target != input.target
-        || expiry <= now()
-        || (input.role == "controller" && controller != 0)
-        || (input.role == "device" && device != 0)
-    {
-        return Err(denied());
+    if target != input.target {
+        return Err(forbidden("relay attempt belongs to another device"));
+    }
+    if expiry <= now() {
+        return Err(forbidden("relay attempt expired"));
+    }
+    if (input.role == "controller" && controller != 0) || (input.role == "device" && device != 0) {
+        return Err(forbidden("relay role already admitted"));
     }
     let outstanding: i64 =
         sqlx::query_scalar("SELECT count(*) FROM relay_tickets WHERE credential_hash=?")
@@ -270,13 +480,20 @@ pub(crate) async fn relay_ticket(
             .fetch_one(&mut *tx)
             .await?;
     if outstanding >= 20 {
-        return Err(invalid("Too many pending relay tickets"));
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many pending relay tickets",
+        ));
     }
     let ticket = auth::random_token();
+    // A ticket can never outlive its attempt: claims also require a live attempt.
+    let ticket_expiry = (now() + 30).min(expiry);
     sqlx::query("INSERT INTO relay_tickets(hash,uuid,device_id,role,credential_hash,expires_at) VALUES(?,?,?,?,?,?)")
-        .bind(auth::digest(&ticket)).bind(&input.uuid).bind(&target).bind(&input.role).bind(credential).bind(now()+30).execute(&mut *tx).await?;
+        .bind(auth::digest(&ticket)).bind(&input.uuid).bind(&target).bind(&input.role).bind(credential).bind(ticket_expiry).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(Json(json!({"ticket":ticket,"expires_in":30})))
+    Ok(Json(
+        json!({"ticket":ticket,"expires_in":(ticket_expiry - now()).max(0)}),
+    ))
 }
 #[derive(Deserialize)]
 pub(crate) struct Claim {
@@ -441,6 +658,21 @@ pub(crate) async fn client_audit(
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
+// The native client picks its peer icon from these exact names; reports carry a full OS label.
+fn peer_platform(os: &str) -> &'static str {
+    let os = os.to_ascii_lowercase();
+    if os.contains("windows") {
+        "Windows"
+    } else if os.contains("android") {
+        "Android"
+    } else if os.contains("mac") || os.contains("darwin") {
+        "Mac OS"
+    } else if os.contains("linux") {
+        "Linux"
+    } else {
+        ""
+    }
+}
 pub(crate) async fn legacy_address_book(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -457,7 +689,7 @@ pub(crate) async fn legacy_address_book(
     .await?;
     let peers: Vec<Value> = devices
         .into_iter()
-        .map(|d| json!({"id":d.id,"alias":d.name,"platform":d.platform,"tags":[]}))
+        .map(|d| json!({"id":d.id,"alias":d.name,"platform":peer_platform(&d.platform),"tags":[]}))
         .collect();
     Ok(Json(
         json!({"data":json!({"tags":[],"peers":peers}).to_string()}),

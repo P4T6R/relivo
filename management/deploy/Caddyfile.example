@@ -8,5 +8,8 @@ support.example.com {
     reverse_proxy @relay 127.0.0.1:21119 {
         header_up X-Real-IP {remote_host}
     }
-    reverse_proxy 127.0.0.1:21114
+    reverse_proxy 127.0.0.1:21114 {
+        # Overwrites any client-supplied value; used for sign-in limits and audit.
+        header_up X-Real-IP {remote_host}
+    }
 }

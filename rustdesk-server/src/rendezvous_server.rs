@@ -61,6 +61,15 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 const MAX_RELAY_UUID_LEN: usize = 128;
+// On UUID_MISMATCH the RustDesk client drops its ID and picks a new random one.
+fn uuid_mismatch_hint() -> &'static str {
+    if crate::management::enabled() {
+        "; the client will switch to a new random ID, so the device enrolled in the management \
+console under this ID will look offline until it is re-enrolled"
+    } else {
+        "; the client will switch to a new random ID"
+    }
+}
 
 // The peer sends this uuid to whatever relay_server names, so keep control bytes out of it.
 fn validate_relay_uuid(value: &str) -> Result<(), &'static str> {
@@ -73,6 +82,92 @@ fn validate_relay_uuid(value: &str) -> Result<(), &'static str> {
         return Err("Invalid relay UUID");
     }
     Ok(())
+}
+
+// The management API only accepts attempt IDs of 16 to 128 characters; checking it here
+// gives the client "invalid request" at once instead of a misleading API refusal.
+const MIN_MANAGED_RELAY_UUID_LEN: usize = 16;
+
+fn validate_managed_relay_uuid(value: &str) -> Result<(), &'static str> {
+    validate_relay_uuid(value)?;
+    if value.len() < MIN_MANAGED_RELAY_UUID_LEN {
+        return Err("Relay UUID too short for managed mode");
+    }
+    Ok(())
+}
+
+/// Why hbbs refused a managed RequestRelay. The client shows `reason()` verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedRefusal {
+    InvalidRequest,
+    DeviceOffline,
+    NotAuthorized,
+    SignInExpired,
+    NoAccess,
+    DeviceNotApproved,
+    DeviceIdentityChanged,
+    ServiceUnavailable,
+}
+
+impl ManagedRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "Managed connection denied: invalid request",
+            Self::DeviceOffline => "Managed connection denied: device offline",
+            Self::NotAuthorized => "Managed connection denied: not authorized",
+            Self::SignInExpired => {
+                "Managed connection denied: your Relivo sign-in has expired, sign in again on this computer (Settings > Account)"
+            }
+            Self::NoAccess => {
+                "Managed connection denied: your account has no access rule for this device"
+            }
+            Self::DeviceNotApproved => {
+                "Managed connection denied: the device is not enrolled or not approved in the Relivo console"
+            }
+            Self::DeviceIdentityChanged => {
+                "Managed connection denied: the device identity changed (reinstalled?), rotate its credential in the Relivo console"
+            }
+            Self::ServiceUnavailable => {
+                "Managed connection denied: management service unavailable"
+            }
+        }
+    }
+}
+
+impl From<&crate::management::ManagementError> for ManagedRefusal {
+    fn from(err: &crate::management::ManagementError) -> Self {
+        match err {
+            crate::management::ManagementError::Denied(reason) => Self::from_denial(reason),
+            crate::management::ManagementError::Unavailable(_) => Self::ServiceUnavailable,
+        }
+    }
+}
+
+impl ManagedRefusal {
+    /// `reason` is a `ManagementError::Denied` text: "HTTP <status> on <path>[: <API reason>]".
+    /// Only the management API's fixed reasons are mapped; anything else stays generic.
+    fn from_denial(reason: &str) -> Self {
+        match reason.split_once(": ").map(|(_, api)| api) {
+            Some("session expired" | "sign in required") => Self::SignInExpired,
+            Some("no connect grant" | "viewer role cannot connect") => Self::NoAccess,
+            Some(
+                "device not enrolled" | "device not verified" | "device not approved"
+                | "device disabled",
+            ) => Self::DeviceNotApproved,
+            Some("device identity mismatch") => Self::DeviceIdentityChanged,
+            _ => Self::NotAuthorized,
+        }
+    }
+}
+
+/// Bounds a client-supplied peer ID before it is written to the log (print it with `{:?}`
+/// so control characters are escaped).
+fn log_id(id: &str) -> &str {
+    let mut end = id.len().min(MAX_PEER_ID_LEN);
+    while !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    &id[..end]
 }
 
 // A peer acknowledging a RequestRelay leaves both fields empty.
@@ -294,7 +389,9 @@ impl RendezvousServer {
                     }
                     LoopFailure::Listener3 => {
                         drop(listener3);
-                        listener3 = create_tcp_listener(bind_addr, ws_port).await?;
+                        // Recreate the WebSocket listener on the same address as at startup
+                        // (loopback in managed mode, so it stays behind the TLS proxy).
+                        listener3 = create_tcp_listener(ws_bind, ws_port).await?;
                     }
                 }
             }
@@ -437,6 +534,12 @@ impl RendezvousServer {
                     let id = rk.id;
                     let ip = addr.ip().to_string();
                     if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
+                        log::info!(
+                            "RegisterPk from {} answered UUID_MISMATCH: ID length {} outside 6..={}",
+                            ip,
+                            id.len(),
+                            MAX_PEER_ID_LEN
+                        );
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
@@ -450,22 +553,22 @@ impl RendezvousServer {
                             if peer.uuid == rk.uuid {
                                 if peer.info.ip != ip && peer.pk != rk.pk {
                                     log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                                        "RegisterPk for {:?} from {} answered UUID_MISMATCH: same uuid but both the IP (registered from {}) and the public key differ{}",
                                         id,
                                         ip,
-                                        rk.pk,
                                         peer.info.ip,
-                                        peer.pk,
+                                        uuid_mismatch_hint(),
                                     );
                                     drop(peer);
                                     return send_rk_res(socket, addr, UUID_MISMATCH).await;
                                 }
                             } else {
                                 log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
+                                    "RegisterPk for {:?} from {} answered UUID_MISMATCH: the uuid differs from the one registered (from {}) for this ID{}",
                                     id,
-                                    rk.uuid,
-                                    peer.uuid
+                                    ip,
+                                    peer.info.ip,
+                                    uuid_mismatch_hint(),
                                 );
                                 drop(peer);
                                 return send_rk_res(socket, addr, UUID_MISMATCH).await;
@@ -587,10 +690,25 @@ impl RendezvousServer {
                         let mut reply = RendezvousMessage::new();
                         match result {
                             Ok(response) => reply.set_relay_response(response),
-                            Err(_) => reply.set_relay_response(RelayResponse {
-                                refuse_reason: "Managed connection denied".to_owned(),
-                                ..Default::default()
-                            }),
+                            Err((refusal, detail)) => {
+                                // Never log rf.token: it is the controller's session credential.
+                                let ip = try_into_v4(addr).ip();
+                                if refusal == ManagedRefusal::ServiceUnavailable {
+                                    log::warn!(
+                                        "Managed relay request to {:?} from {} refused: {} ({})",
+                                        log_id(&rf.id), ip, refusal.reason(), detail
+                                    );
+                                } else {
+                                    log::info!(
+                                        "Managed relay request to {:?} from {} refused: {} ({})",
+                                        log_id(&rf.id), ip, refusal.reason(), detail
+                                    );
+                                }
+                                reply.set_relay_response(RelayResponse {
+                                    refuse_reason: refusal.reason().to_owned(),
+                                    ..Default::default()
+                                });
+                            }
                         }
                         Self::send_to_sink(sink, reply).await;
                         return false;
@@ -678,17 +796,55 @@ impl RendezvousServer {
         false
     }
 
-    async fn managed_relay_request(&mut self, request: &RequestRelay, addr: SocketAddr, ws: bool) -> ResultType<RelayResponse> {
-        if !ws { bail!("Managed controller requests require the TLS WebSocket proxy"); }
-        validate_relay_uuid(&request.uuid).map_err(|e| hbb_common::anyhow::anyhow!(e))?;
-        let peer = self.pm.get_in_memory(&request.id).await.ok_or_else(|| hbb_common::anyhow::anyhow!("Device offline"))?;
+    /// Authorizes a managed controller's RequestRelay and forwards it to the device.
+    /// On refusal, returns the reason shown to the client and a detail for the log.
+    async fn managed_relay_request(
+        &mut self,
+        request: &RequestRelay,
+        addr: SocketAddr,
+        ws: bool,
+    ) -> Result<RelayResponse, (ManagedRefusal, String)> {
+        use ManagedRefusal::*;
+        if !ws {
+            return Err((InvalidRequest, "not received through the TLS WebSocket proxy".to_owned()));
+        }
+        if request.id.is_empty() || request.id.len() > MAX_PEER_ID_LEN {
+            return Err((InvalidRequest, format!("invalid target ID (length {})", request.id.len())));
+        }
+        validate_managed_relay_uuid(&request.uuid)
+            .map_err(|e| (InvalidRequest, format!("{e} (length {})", request.uuid.len())))?;
+        let peer = self.pm.get_in_memory(&request.id).await.ok_or_else(|| {
+            (DeviceOffline, "device never registered since hbbs started".to_owned())
+        })?;
         let (pk, peer_addr, elapsed) = {
             let p = peer.read().await;
             (p.pk.clone(), p.socket_addr, p.last_reg_time.elapsed().as_millis() as i64)
         };
-        if elapsed >= REG_TIMEOUT { bail!("Device offline"); }
-        crate::management::authorize(&request.token, &request.id, &pk, request.conn_type.value(), &request.uuid).await?;
-        let relay_server = crate::management::relay_url()?;
+        if peer_addr.port() == 0 {
+            // Loaded from the database (RegisterPk or a lookup) but no RegisterPeer heartbeat yet.
+            return Err((DeviceOffline, "device never registered since hbbs started".to_owned()));
+        }
+        if elapsed >= REG_TIMEOUT {
+            return Err((DeviceOffline, format!("last registration {}s ago", elapsed / 1000)));
+        }
+        if let Err(err) = crate::management::authorize(
+            &request.token,
+            &request.id,
+            &pk,
+            request.conn_type.value(),
+            &request.uuid,
+        )
+        .await
+        {
+            let refusal = ManagedRefusal::from(&err);
+            let mut detail = err.to_string();
+            if pk.is_empty() {
+                detail.push_str("; the device has not registered its public key yet");
+            }
+            return Err((refusal, detail));
+        }
+        let relay_server = crate::management::relay_url()
+            .map_err(|e| (ServiceUnavailable, e.to_string()))?;
         let mut forward = request.clone();
         forward.token.clear();
         forward.relay_server = relay_server.clone();
@@ -696,7 +852,15 @@ impl RendezvousServer {
         forward.secure = true;
         let mut message = RendezvousMessage::new();
         message.set_request_relay(forward);
-        self.tx.send(Data::Msg(message.into(), peer_addr))?;
+        self.tx
+            .send(Data::Msg(message.into(), peer_addr))
+            .map_err(|_| (ServiceUnavailable, "hbbs is shutting down".to_owned()))?;
+        log::info!(
+            "Managed relay request {} to {:?} from {} authorized",
+            request.uuid,
+            log_id(&request.id),
+            try_into_v4(addr).ip()
+        );
         let mut response = RelayResponse {
             uuid: request.uuid.clone(), relay_server, ..Default::default()
         };
@@ -1596,6 +1760,115 @@ mod tests {
             assert!(validate_relay_uuid(value).is_err(), "accepted {value:?}");
             assert!(validate_relay_response(value, "relay.example").is_err());
         }
+    }
+
+    #[test]
+    fn managed_relay_uuid_matches_management_api_bounds() {
+        let uuid = "e4c181d0-41c7-4ae6-8ef0-36581b6b2b12";
+        assert_eq!(validate_managed_relay_uuid(uuid), Ok(()));
+        assert_eq!(validate_managed_relay_uuid(&"a".repeat(16)), Ok(()));
+        assert_eq!(validate_managed_relay_uuid(&"a".repeat(128)), Ok(()));
+        for value in ["a".repeat(15), "a".repeat(129), String::new(), "a\n".repeat(8)] {
+            assert!(validate_managed_relay_uuid(&value).is_err(), "accepted {value:?}");
+        }
+        // Outside managed mode short attempt IDs stay accepted.
+        assert_eq!(validate_relay_uuid("a_b-c"), Ok(()));
+    }
+
+    #[test]
+    fn managed_refusal_reasons_are_distinct_and_exact() {
+        use crate::management::ManagementError;
+        assert_eq!(
+            ManagedRefusal::InvalidRequest.reason(),
+            "Managed connection denied: invalid request"
+        );
+        assert_eq!(
+            ManagedRefusal::DeviceOffline.reason(),
+            "Managed connection denied: device offline"
+        );
+        assert_eq!(
+            ManagedRefusal::NotAuthorized.reason(),
+            "Managed connection denied: not authorized"
+        );
+        assert_eq!(
+            ManagedRefusal::ServiceUnavailable.reason(),
+            "Managed connection denied: management service unavailable"
+        );
+        assert_eq!(
+            ManagedRefusal::from(&ManagementError::Denied("HTTP 403".into())),
+            ManagedRefusal::NotAuthorized
+        );
+        assert_eq!(
+            ManagedRefusal::from(&ManagementError::Unavailable("HTTP 503".into())),
+            ManagedRefusal::ServiceUnavailable
+        );
+        for (denial, refusal) in [
+            ("HTTP 401 on /authorize: session expired", ManagedRefusal::SignInExpired),
+            ("HTTP 401 on /authorize: sign in required", ManagedRefusal::SignInExpired),
+            // A wrong internal key is a server fault, not the user's sign-in.
+            ("HTTP 401 on /authorize: Sign in required", ManagedRefusal::NotAuthorized),
+            ("HTTP 403 on /authorize: no connect grant", ManagedRefusal::NoAccess),
+            ("HTTP 403 on /authorize: device not approved", ManagedRefusal::DeviceNotApproved),
+            ("HTTP 403 on /authorize: device identity mismatch", ManagedRefusal::DeviceIdentityChanged),
+            ("HTTP 403 on /authorize: Access denied", ManagedRefusal::NotAuthorized),
+            ("authorization not granted", ManagedRefusal::NotAuthorized),
+            ("HTTP 403 on /authorize: viewer role cannot connect", ManagedRefusal::NoAccess),
+            ("HTTP 403 on /authorize: device not enrolled", ManagedRefusal::DeviceNotApproved),
+            ("HTTP 403 on /authorize: device not verified", ManagedRefusal::DeviceNotApproved),
+            ("HTTP 403 on /authorize: device disabled", ManagedRefusal::DeviceNotApproved),
+            // Only the exact API text maps; a prefix or a case change does not.
+            ("HTTP 403 on /authorize: device disabled by admin", ManagedRefusal::NotAuthorized),
+            ("HTTP 401 on /authorize: Session expired", ManagedRefusal::NotAuthorized),
+            ("HTTP 401 on /authorize", ManagedRefusal::NotAuthorized),
+            ("", ManagedRefusal::NotAuthorized),
+        ] {
+            assert_eq!(ManagedRefusal::from(&ManagementError::Denied(denial.into())), refusal, "{denial}");
+        }
+        // Every specific refusal tells the user what to do, distinct from the others.
+        let reasons = [
+            ManagedRefusal::InvalidRequest,
+            ManagedRefusal::DeviceOffline,
+            ManagedRefusal::NotAuthorized,
+            ManagedRefusal::ServiceUnavailable,
+            ManagedRefusal::SignInExpired,
+            ManagedRefusal::NoAccess,
+            ManagedRefusal::DeviceNotApproved,
+            ManagedRefusal::DeviceIdentityChanged,
+        ]
+        .map(|r| r.reason());
+        for (i, reason) in reasons.iter().enumerate() {
+            assert!(reason.starts_with("Managed connection denied: "), "{reason}");
+            assert!(!reasons[..i].contains(reason), "duplicate: {reason}");
+        }
+    }
+
+    /// The mapping above matches the management API's literal refusal texts; a
+    /// rename there would silently turn a precise message into "not authorized".
+    #[test]
+    fn managed_refusals_match_the_management_api_texts() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../management/src/native.rs");
+        let api = std::fs::read_to_string(path).expect("management API source next to the server");
+        for text in [
+            "session expired",
+            "sign in required",
+            "no connect grant",
+            "viewer role cannot connect",
+            "device not enrolled",
+            "device not verified",
+            "device not approved",
+            "device disabled",
+            "device identity mismatch",
+        ] {
+            assert!(api.contains(&format!("\"{text}\"")), "{text} no longer sent by the API");
+        }
+    }
+
+    #[test]
+    fn log_id_is_bounded_on_a_char_boundary() {
+        assert_eq!(log_id("123456789"), "123456789");
+        let long = "é".repeat(MAX_PEER_ID_LEN);
+        let cut = log_id(&long);
+        assert!(cut.len() <= MAX_PEER_ID_LEN && long.starts_with(cut));
     }
 
     #[hbb_common::tokio::test]

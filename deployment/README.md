@@ -14,6 +14,8 @@ Target: the owner's Ubuntu VPS at `72.62.178.54`. The owner explicitly authorize
 application of the prepared deployment. Bundle `2026-11-11.3` is now installed
 behind the existing Nginx with HTTPS; see the
 [deployment record](../docs/enterprise/deployment-2026-11-11.md).
+On 2026-11-27 it was upgraded in place to images `2026-11-27.1`; see the
+[upgrade record](../docs/enterprise/deployment-2026-11-27.md).
 
 Confirmed domain: **relivo-desk.duckdns.org**. Public endpoints are
 `https://relivo-desk.duckdns.org` and

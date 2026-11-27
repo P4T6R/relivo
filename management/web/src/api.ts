@@ -16,6 +16,14 @@ export type Device = {
   created_at: number;
   note: string;
   public_key: string;
+  last_rejected_at: number | null;
+  last_rejection:
+    | ""
+    | "id_mismatch"
+    | "uuid"
+    | "public_key"
+    | "uuid_public_key"
+    | "disabled";
   can_connect: boolean;
 };
 export type Group = {
