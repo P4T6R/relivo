@@ -43,7 +43,7 @@ if not WINDOWS:
 features = "flutter,relivo-managed" + (",screencapturekit" if not WINDOWS and ARCH == "arm64" else "")
 run("cargo", "build", "--locked", "--release", *(["--lib"] if WINDOWS else []), "--features", features)
 run(sys.executable, "build.py", "--flutter", "--skip-cargo", *(["--portable", "--skip-portable-pack"] if WINDOWS else []))
-run("cargo", "test", "--locked", "--release", "--lib", "--features", features, "management::package::tests")
+run("cargo", "test", "--locked", "--release", "--lib", "--features", features, "management::")
 OUTPUT.mkdir(exist_ok=True)
 prefix = f"relivo-agent-{VERSION}-{'windows' if WINDOWS else 'macos'}-{ARCH}"
 if WINDOWS:

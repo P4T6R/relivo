@@ -1812,8 +1812,54 @@ mod tests {
             ("HTTP 403 on /authorize: device identity mismatch", ManagedRefusal::DeviceIdentityChanged),
             ("HTTP 403 on /authorize: Access denied", ManagedRefusal::NotAuthorized),
             ("authorization not granted", ManagedRefusal::NotAuthorized),
+            ("HTTP 403 on /authorize: viewer role cannot connect", ManagedRefusal::NoAccess),
+            ("HTTP 403 on /authorize: device not enrolled", ManagedRefusal::DeviceNotApproved),
+            ("HTTP 403 on /authorize: device not verified", ManagedRefusal::DeviceNotApproved),
+            ("HTTP 403 on /authorize: device disabled", ManagedRefusal::DeviceNotApproved),
+            // Only the exact API text maps; a prefix or a case change does not.
+            ("HTTP 403 on /authorize: device disabled by admin", ManagedRefusal::NotAuthorized),
+            ("HTTP 401 on /authorize: Session expired", ManagedRefusal::NotAuthorized),
+            ("HTTP 401 on /authorize", ManagedRefusal::NotAuthorized),
+            ("", ManagedRefusal::NotAuthorized),
         ] {
             assert_eq!(ManagedRefusal::from(&ManagementError::Denied(denial.into())), refusal, "{denial}");
+        }
+        // Every specific refusal tells the user what to do, distinct from the others.
+        let reasons = [
+            ManagedRefusal::InvalidRequest,
+            ManagedRefusal::DeviceOffline,
+            ManagedRefusal::NotAuthorized,
+            ManagedRefusal::ServiceUnavailable,
+            ManagedRefusal::SignInExpired,
+            ManagedRefusal::NoAccess,
+            ManagedRefusal::DeviceNotApproved,
+            ManagedRefusal::DeviceIdentityChanged,
+        ]
+        .map(|r| r.reason());
+        for (i, reason) in reasons.iter().enumerate() {
+            assert!(reason.starts_with("Managed connection denied: "), "{reason}");
+            assert!(!reasons[..i].contains(reason), "duplicate: {reason}");
+        }
+    }
+
+    /// The mapping above matches the management API's literal refusal texts; a
+    /// rename there would silently turn a precise message into "not authorized".
+    #[test]
+    fn managed_refusals_match_the_management_api_texts() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../management/src/native.rs");
+        let api = std::fs::read_to_string(path).expect("management API source next to the server");
+        for text in [
+            "session expired",
+            "sign in required",
+            "no connect grant",
+            "viewer role cannot connect",
+            "device not enrolled",
+            "device not verified",
+            "device not approved",
+            "device disabled",
+            "device identity mismatch",
+        ] {
+            assert!(api.contains(&format!("\"{text}\"")), "{text} no longer sent by the API");
         }
     }
 

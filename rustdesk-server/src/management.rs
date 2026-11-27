@@ -140,7 +140,9 @@ async fn post(path: &str, body: Value) -> Result<Value, ManagementError> {
 /// The API's own refusal reason (its `error` field: a fixed text, never a token),
 /// bounded and stripped of control characters for the log.
 async fn api_error(response: reqwest::Response) -> Option<String> {
-    let value: Value = response.json().await.ok()?;
+    refusal_detail(&response.json::<Value>().await.ok()?)
+}
+fn refusal_detail(value: &Value) -> Option<String> {
     let detail: String = value["error"]
         .as_str()?
         .chars()
@@ -222,6 +224,33 @@ mod tests {
                 matches!(classify_status(status), Some(ManagementError::Unavailable(_))),
                 "{status}"
             );
+        }
+    }
+
+    #[test]
+    fn refusal_detail_is_the_bounded_api_error_text() {
+        assert_eq!(
+            refusal_detail(&json!({"error": "session expired"})).as_deref(),
+            Some("session expired")
+        );
+        // Control characters cannot forge extra log lines.
+        assert_eq!(
+            refusal_detail(&json!({"error": "no connect\ngrant\r\u{1b}[31m"})).as_deref(),
+            Some("no connectgrant[31m")
+        );
+        let long = "x".repeat(500);
+        assert_eq!(refusal_detail(&json!({ "error": long })).map(|d| d.chars().count()), Some(120));
+        for value in [
+            json!({}),
+            json!({"error": ""}),
+            json!({"error": "\n\t"}),
+            json!({"error": 403}),
+            json!({"error": null}),
+            json!({"message": "session expired"}),
+            json!("session expired"),
+            json!([]),
+        ] {
+            assert_eq!(refusal_detail(&value), None, "{value}");
         }
     }
 
