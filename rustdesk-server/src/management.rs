@@ -123,7 +123,10 @@ async fn post(path: &str, body: Value) -> Result<Value, ManagementError> {
         })?;
     if let Some(err) = classify_status(response.status()) {
         return Err(match err {
-            ManagementError::Denied(r) => ManagementError::Denied(format!("{r} on {path}")),
+            ManagementError::Denied(r) => match api_error(response).await {
+                Some(detail) => ManagementError::Denied(format!("{r} on {path}: {detail}")),
+                None => ManagementError::Denied(format!("{r} on {path}")),
+            },
             ManagementError::Unavailable(r) => {
                 ManagementError::Unavailable(format!("{r} on {path}"))
             }
@@ -133,6 +136,18 @@ async fn post(path: &str, body: Value) -> Result<Value, ManagementError> {
         .json()
         .await
         .map_err(|e| ManagementError::Unavailable(format!("unreadable response on {path}: {e}")))
+}
+/// The API's own refusal reason (its `error` field: a fixed text, never a token),
+/// bounded and stripped of control characters for the log.
+async fn api_error(response: reqwest::Response) -> Option<String> {
+    let value: Value = response.json().await.ok()?;
+    let detail: String = value["error"]
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    (!detail.is_empty()).then_some(detail)
 }
 pub(crate) async fn authorize(
     token: &str,

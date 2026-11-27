@@ -102,6 +102,10 @@ enum ManagedRefusal {
     InvalidRequest,
     DeviceOffline,
     NotAuthorized,
+    SignInExpired,
+    NoAccess,
+    DeviceNotApproved,
+    DeviceIdentityChanged,
     ServiceUnavailable,
 }
 
@@ -111,6 +115,18 @@ impl ManagedRefusal {
             Self::InvalidRequest => "Managed connection denied: invalid request",
             Self::DeviceOffline => "Managed connection denied: device offline",
             Self::NotAuthorized => "Managed connection denied: not authorized",
+            Self::SignInExpired => {
+                "Managed connection denied: your Relivo sign-in has expired, sign in again on this computer (Settings > Account)"
+            }
+            Self::NoAccess => {
+                "Managed connection denied: your account has no access rule for this device"
+            }
+            Self::DeviceNotApproved => {
+                "Managed connection denied: the device is not enrolled or not approved in the Relivo console"
+            }
+            Self::DeviceIdentityChanged => {
+                "Managed connection denied: the device identity changed (reinstalled?), rotate its credential in the Relivo console"
+            }
             Self::ServiceUnavailable => {
                 "Managed connection denied: management service unavailable"
             }
@@ -121,8 +137,25 @@ impl ManagedRefusal {
 impl From<&crate::management::ManagementError> for ManagedRefusal {
     fn from(err: &crate::management::ManagementError) -> Self {
         match err {
-            crate::management::ManagementError::Denied(_) => Self::NotAuthorized,
+            crate::management::ManagementError::Denied(reason) => Self::from_denial(reason),
             crate::management::ManagementError::Unavailable(_) => Self::ServiceUnavailable,
+        }
+    }
+}
+
+impl ManagedRefusal {
+    /// `reason` is a `ManagementError::Denied` text: "HTTP <status> on <path>[: <API reason>]".
+    /// Only the management API's fixed reasons are mapped; anything else stays generic.
+    fn from_denial(reason: &str) -> Self {
+        match reason.split_once(": ").map(|(_, api)| api) {
+            Some("session expired" | "sign in required") => Self::SignInExpired,
+            Some("no connect grant" | "viewer role cannot connect") => Self::NoAccess,
+            Some(
+                "device not enrolled" | "device not verified" | "device not approved"
+                | "device disabled",
+            ) => Self::DeviceNotApproved,
+            Some("device identity mismatch") => Self::DeviceIdentityChanged,
+            _ => Self::NotAuthorized,
         }
     }
 }
@@ -1769,6 +1802,19 @@ mod tests {
             ManagedRefusal::from(&ManagementError::Unavailable("HTTP 503".into())),
             ManagedRefusal::ServiceUnavailable
         );
+        for (denial, refusal) in [
+            ("HTTP 401 on /authorize: session expired", ManagedRefusal::SignInExpired),
+            ("HTTP 401 on /authorize: sign in required", ManagedRefusal::SignInExpired),
+            // A wrong internal key is a server fault, not the user's sign-in.
+            ("HTTP 401 on /authorize: Sign in required", ManagedRefusal::NotAuthorized),
+            ("HTTP 403 on /authorize: no connect grant", ManagedRefusal::NoAccess),
+            ("HTTP 403 on /authorize: device not approved", ManagedRefusal::DeviceNotApproved),
+            ("HTTP 403 on /authorize: device identity mismatch", ManagedRefusal::DeviceIdentityChanged),
+            ("HTTP 403 on /authorize: Access denied", ManagedRefusal::NotAuthorized),
+            ("authorization not granted", ManagedRefusal::NotAuthorized),
+        ] {
+            assert_eq!(ManagedRefusal::from(&ManagementError::Denied(denial.into())), refusal, "{denial}");
+        }
     }
 
     #[test]

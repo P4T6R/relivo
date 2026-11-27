@@ -1124,7 +1124,12 @@ function EditorDialog({
           {
             id: str("id"),
             name: str("name"),
-            platform: str("platform"),
+            // The agent reports its platform; omitted when untouched so a dialog
+            // opened before that report does not erase it.
+            platform:
+              editor.item && str("platform") === (editor.item.platform || "")
+                ? undefined
+                : str("platform"),
             note: str("note"),
             state: str("state") || "pending",
           },
