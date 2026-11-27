@@ -97,6 +97,11 @@ pub(crate) fn enrich_report(value: &mut Value) {
         value["management_pk"] = json!(crate::encode64(Config::get_key_pair().1));
     }
 }
+/// Server-supplied text made safe to show or log: one line, no control characters,
+/// at most `max` characters.
+pub(crate) fn display_text(text: &str, max: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(max).collect()
+}
 /// The message shown when the API refuses a relay ticket. The API's `error` field is a
 /// short, non-secret reason such as "no connect grant"; it is bounded and stripped of
 /// control characters.
@@ -110,7 +115,7 @@ fn ticket_refusal(status: u16, device: bool, body: Option<&Value>) -> String {
     };
     let detail = body
         .and_then(|v| v["error"].as_str())
-        .map(|s| s.chars().filter(|c| !c.is_control()).take(120).collect::<String>())
+        .map(|s| display_text(s, 120))
         .filter(|s| !s.is_empty());
     match detail {
         Some(detail) => format!("Managed connection denied (HTTP {status}: {detail}): {reason}"),
@@ -195,6 +200,14 @@ mod tests {
                 format!("Managed connection denied (HTTP {status}): the management service rejected the request")
             );
         }
+    }
+
+    #[test]
+    fn display_text_is_one_bounded_line() {
+        assert_eq!(display_text("Managed connection denied: device offline", 300), "Managed connection denied: device offline");
+        assert_eq!(display_text("a\nb\r\u{1b}[2Jc\u{7}", 300), "ab[2Jc");
+        assert_eq!(display_text(&"é".repeat(500), 300).chars().count(), 300);
+        assert_eq!(display_text("", 10), "");
     }
 
     #[test]

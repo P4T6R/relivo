@@ -84,6 +84,28 @@ fn validate_relay_uuid(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Longest machine UUID a peer may register (RustDesk sends at most a few dozen bytes).
+const MAX_REGISTER_UUID_LEN: usize = 128;
+
+/// Rejects a RegisterPk whose fields cannot come from a real client: the key is an
+/// Ed25519 public key (32 bytes), the UUID is short, and IDs use the RustDesk alphabet.
+/// Without this, one spoofed UDP packet can store and log about 64 KB per new ID.
+fn validate_register_pk(id: &str, uuid: &[u8], pk: &[u8]) -> Result<(), &'static str> {
+    if pk.len() != 32 {
+        return Err("public key is not 32 bytes");
+    }
+    if uuid.is_empty() || uuid.len() > MAX_REGISTER_UUID_LEN {
+        return Err("uuid length out of range");
+    }
+    if id.len() < 6
+        || id.len() > MAX_PEER_ID_LEN
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid ID");
+    }
+    Ok(())
+}
+
 // The management API only accepts attempt IDs of 16 to 128 characters; checking it here
 // gives the client "invalid request" at once instead of a misleading API refusal.
 const MIN_MANAGED_RELAY_UUID_LEN: usize = 16;
@@ -533,12 +555,12 @@ impl RendezvousServer {
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
-                    if id.len() < 6 || id.len() > MAX_PEER_ID_LEN {
+                    if let Err(reason) = validate_register_pk(&id, &rk.uuid, &rk.pk) {
                         log::info!(
-                            "RegisterPk from {} answered UUID_MISMATCH: ID length {} outside 6..={}",
+                            "RegisterPk for {:?} from {} answered UUID_MISMATCH: {}",
+                            log_id(&id),
                             ip,
-                            id.len(),
-                            MAX_PEER_ID_LEN
+                            reason
                         );
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
@@ -902,7 +924,7 @@ impl RendezvousServer {
             (true, None)
         };
         if let Some(old) = ip_change {
-            log::info!("IP change of {} from {} to {}", id, old, socket_addr);
+            log::info!("IP change of {:?} from {} to {}", log_id(&id), old, socket_addr);
         }
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_register_peer_response(RegisterPeerResponse {
@@ -1861,6 +1883,26 @@ mod tests {
         ] {
             assert!(api.contains(&format!("\"{text}\"")), "{text} no longer sent by the API");
         }
+    }
+
+    #[test]
+    fn register_pk_accepts_only_real_client_fields() {
+        let pk = [7u8; 32];
+        assert_eq!(validate_register_pk("123456789", b"machine-uuid", &pk), Ok(()));
+        assert_eq!(validate_register_pk("custom_id-1", &[1u8; 16], &pk), Ok(()));
+        for (id, uuid, key, why) in [
+            ("123456789", &b"u"[..], &[7u8; 31][..], "short key"),
+            ("123456789", &b"u"[..], &[7u8; 33][..], "long key"),
+            ("123456789", &b"u"[..], &[7u8; 65536][..], "64 KB key"),
+            ("123456789", &[1u8; 129][..], &pk[..], "long uuid"),
+            ("12345", &b"u"[..], &pk[..], "short id"),
+            ("123456\n[ERROR] forged", &b"u"[..], &pk[..], "newline in id"),
+            ("123 456789", &b"u"[..], &pk[..], "space in id"),
+            ("1234567é", &b"u"[..], &pk[..], "non-ASCII id"),
+        ] {
+            assert!(validate_register_pk(id, uuid, key).is_err(), "{why}");
+        }
+        assert!(validate_register_pk(&"9".repeat(MAX_PEER_ID_LEN + 1), b"u", &pk).is_err());
     }
 
     #[test]

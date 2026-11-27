@@ -69,7 +69,8 @@ successfully after the fix.
 The relay integration exchanges test payloads. It does not simulate or claim
 desktop capture, input control, the peer-encryption handshake, native account UI,
 or endpoint consent. These checks are implementation verification, not an
-independent security review or production acceptance.
+independent security review or production acceptance. A first code review and
+local attack run is recorded in [security-review-2026-11-27.md](security-review-2026-11-27.md).
 
 ## Remaining acceptance before production
 

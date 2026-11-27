@@ -1203,6 +1203,52 @@ async fn sign_in_limits_use_the_forwarded_address_only_behind_a_loopback_proxy()
 }
 
 #[tokio::test]
+async fn a_stranger_cannot_lock_an_account_out() {
+    let h = Harness::new().await;
+    let bad = json!({"username":"admin","password":"not-the-password"}).to_string();
+    let good = json!({"username":"admin","password":PASSWORD}).to_string();
+    let from = |ip: &'static str, body: String| {
+        let app = h.app.clone();
+        async move { raw(&app, "/api/login", "", &body, Some("127.0.0.1:50100"), &[("x-real-ip", ip)]).await.0 }
+    };
+    for _ in 0..8 {
+        assert_eq!(from("203.0.113.66", bad.clone()).await, StatusCode::UNAUTHORIZED);
+    }
+    // The attacker's own address is limited for this account...
+    assert_eq!(from("203.0.113.66", good.clone()).await, StatusCode::TOO_MANY_REQUESTS);
+    // ...but the real administrator signs in from elsewhere.
+    assert_eq!(from("198.51.100.20", good.clone()).await, StatusCode::OK);
+    // A distributed attack still meets a per-account ceiling.
+    let account = format!("account:{}", hex::encode(Sha256::digest(b"admin")));
+    sqlx::query("UPDATE login_limits SET count=120 WHERE bucket=?")
+        .bind(&account)
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    assert_eq!(from("192.0.2.77", good).await, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn an_ipv6_prefix_shares_one_sign_in_limit() {
+    let h = Harness::new().await;
+    let bucket = |key: &str| format!("ip:{}", hex::encode(Sha256::digest(key.as_bytes())));
+    sqlx::query("INSERT INTO login_limits(bucket,count,resets_at) VALUES(?,40,strftime('%s','now')+60)")
+        .bind(bucket("2001:db8:1:2::/64"))
+        .execute(&h.state.db)
+        .await
+        .unwrap();
+    let login = json!({"username":"admin","password":PASSWORD}).to_string();
+    let from = |ip: &'static str| {
+        let (app, login) = (h.app.clone(), login.clone());
+        async move { raw(&app, "/api/login", "", &login, Some("127.0.0.1:50200"), &[("x-real-ip", ip)]).await.0 }
+    };
+    // Rotating addresses inside the exhausted /64 does not help.
+    assert_eq!(from("2001:db8:1:2::1").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(from("2001:db8:1:2:ffff:ffff:ffff:fffe").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(from("2001:db8:1:3::1").await, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn connection_refusals_state_a_reason_and_audit_it_without_secrets() {
     let h = Harness::new().await;
     let (_, operator) = h.user("support", "operator").await;

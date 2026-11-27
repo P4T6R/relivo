@@ -1672,12 +1672,12 @@ impl Client {
         // hbbs sends a specific "Managed connection denied: ..." reason; show it as is.
         let response = match response.and_then(|m| m.union) {
             Some(rendezvous_message::Union::RelayResponse(r)) if r.refuse_reason.is_empty() => r,
-            Some(rendezvous_message::Union::RelayResponse(r)) => bail!("{}", r.refuse_reason),
+            Some(rendezvous_message::Union::RelayResponse(r)) => bail!("{}", crate::management::display_text(&r.refuse_reason, 300)),
             _ => bail!("No response from the Relivo ID server ({id_server})"),
         };
         let relay = crate::management::websocket_url("/ws/relay")?;
-        if response.uuid != uuid { bail!("Managed relay configuration mismatch: session '{}' was answered for request '{}'", response.uuid, uuid); }
-        if response.relay_server != relay { bail!("Managed relay configuration mismatch: the ID server announced relay '{}', expected '{}'", response.relay_server, relay); }
+        if response.uuid != uuid { bail!("Managed relay configuration mismatch: session '{}' was answered for request '{}'", crate::management::display_text(&response.uuid, 128), uuid); }
+        if response.relay_server != relay { bail!("Managed relay configuration mismatch: the ID server announced relay '{}', expected '{}'", crate::management::display_text(&response.relay_server, 300), relay); }
         let ticket = crate::management::relay_ticket(peer, &uuid, false).await?;
         let mut stream = crate::management::connect_websocket("/ws/relay").await
             .map_err(|e| anyhow!("Cannot reach the Relivo relay server ({relay}): {e}"))?;

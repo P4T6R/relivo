@@ -102,7 +102,8 @@ impl PeerMap {
         pk: Bytes,
         ip: String,
     ) -> register_pk_response::Result {
-        log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
+        // The ID is validated by the caller; never log the full uuid or key.
+        log::info!("update_pk {:?} {:?} uuid={}B pk={}B", id, addr, uuid.len(), pk.len());
         let (info_str, guid) = {
             let mut w = peer.write().await;
             w.socket_addr = addr;

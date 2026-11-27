@@ -195,6 +195,17 @@ pub(crate) fn client_ip(peer: Option<IpAddr>, headers: &HeaderMap) -> String {
     .unwrap_or(peer)
     .to_string()
 }
+/// The sign-in limit key of a client address: one IPv6 /64 is one client, since a
+/// single host usually controls its whole prefix.
+pub(crate) fn limit_key(ip: &str) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        _ => ip.to_owned(),
+    }
+}
 fn peer(remote: Option<Extension<ConnectInfo<SocketAddr>>>) -> Option<IpAddr> {
     remote.map(|v| v.0 .0.ip())
 }
@@ -217,9 +228,13 @@ async fn login(s: &AppState, raw: Bytes, ip: &str, kind: &str) -> ApiResult<(Pri
         .bind(now())
         .execute(&mut *tx)
         .await?;
+    // Per (account, client) so a stranger cannot lock the real user out; per client
+    // against spraying; and a high per-account cap against distributed guessing.
+    let client = limit_key(ip);
     for (bucket, limit) in [
-        (format!("account:{}", digest(&username)), 8),
-        (format!("ip:{}", digest(ip)), 40),
+        (format!("account-ip:{}", digest(&format!("{username}\n{client}"))), 8),
+        (format!("ip:{}", digest(&client)), 40),
+        (format!("account:{}", digest(&username)), 120),
     ] {
         sqlx::query("INSERT INTO login_limits(bucket,count,resets_at) VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=count+1")
             .bind(&bucket).bind(now()+60).execute(&mut *tx).await?;
@@ -236,12 +251,13 @@ async fn login(s: &AppState, raw: Bytes, ip: &str, kind: &str) -> ApiResult<(Pri
         }
     }
     tx.commit().await?;
-    let _slot = s.hash_slots.try_acquire().map_err(|_| {
-        ApiError(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Sign-in service busy; try again",
-        )
-    })?;
+    // Wait briefly for a password-hashing slot: two concurrent bad sign-ins must not
+    // make every other sign-in fail.
+    let busy = || ApiError(StatusCode::TOO_MANY_REQUESTS, "Sign-in service busy; try again");
+    let _slot = tokio::time::timeout(std::time::Duration::from_secs(10), s.hash_slots.acquire())
+        .await
+        .map_err(|_| busy())?
+        .map_err(|_| busy())?;
     let user: Option<(String, String, i64)> =
         sqlx::query_as("SELECT id,password_hash,enabled FROM users WHERE username=?")
             .bind(&username)
