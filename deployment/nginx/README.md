@@ -4,6 +4,8 @@ This is the target-specific procedure for root@72.62.178.54 and
 relivo-desk.duckdns.org. The owner explicitly authorized this deployment on
 2026-11-11, and it is now installed with HTTPS. See the
 [deployment record](../../docs/enterprise/deployment-2026-11-11.md).
+It now runs images 2026-11-27.1 from /opt/relivo-2026-11-27.1; see the
+[2026-11-27 upgrade record](../../docs/enterprise/deployment-2026-11-27.md).
 The fresh-install commands below are retained for reference; do not rerun
 bootstrap or the initial-install checks against the existing deployment.
 
